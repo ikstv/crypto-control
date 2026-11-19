@@ -40,19 +40,40 @@ def initialize(path):
             db.execute("INSERT INTO history (event) VALUES ('demo_initialized')")
 
 
-def read_portfolio(path):
+def read_portfolio(path, portfolio_id=None):
     with closing(connect(path)) as db, db:
         db.execute("BEGIN")
-        capital = db.execute("SELECT capital_minor FROM settings WHERE id = 1").fetchone()[0]
-        positions = [
-            {"symbol": symbol, "allocation_minor": amount}
-            for symbol, amount in db.execute(
-                "SELECT symbol, allocation_minor FROM positions ORDER BY rowid"
-            )
-        ]
+        settings_columns = {row[1] for row in db.execute("PRAGMA table_info(settings)")}
+        if "portfolio_id" in settings_columns:
+            if portfolio_id is None:
+                raise ValueError("portfolio_id is required for migrated schema")
+            row = db.execute("SELECT capital_minor FROM settings WHERE portfolio_id = ?", (portfolio_id,)).fetchone()
+            if row is None:
+                raise ValueError("Unknown portfolio")
+            capital = row[0]
+            positions = [
+                {"symbol": symbol, "allocation_minor": amount}
+                for symbol, amount in db.execute(
+                    "SELECT symbol, allocation_minor FROM positions WHERE portfolio_id = ? ORDER BY rowid",
+                    (portfolio_id,),
+                )
+            ]
+            currency = db.execute("SELECT currency FROM portfolios WHERE id = ?", (portfolio_id,)).fetchone()
+            if currency is None:
+                raise ValueError("Unknown portfolio")
+            currency = currency[0]
+        else:
+            capital = db.execute("SELECT capital_minor FROM settings WHERE id = 1").fetchone()[0]
+            positions = [
+                {"symbol": symbol, "allocation_minor": amount}
+                for symbol, amount in db.execute(
+                    "SELECT symbol, allocation_minor FROM positions ORDER BY rowid"
+                )
+            ]
+            currency = "UAH"
     allocated = sum(position["allocation_minor"] for position in positions)
     return {
-        "currency": "UAH",
+        "currency": currency,
         "initial_capital_minor": capital,
         "allocated_minor": allocated,
         "unallocated_minor": capital - allocated,
@@ -193,10 +214,12 @@ def migrate_ledger_schema(path):
             raw.rollback()
             return {"status": "already_migrated"}
 
+        renamed = set()
         for table in ("settings", "positions", "history", "paper_start", "paper_operations",
                       "paper_sales", "paper_risk", "paper_equity", "paper_observations"):
             if table in tables:
                 raw.execute(f'ALTER TABLE "{table}" RENAME TO "__legacy_{table}"')
+                renamed.add(table)
 
         raw.execute("""CREATE TABLE settings (
             portfolio_id INTEGER PRIMARY KEY REFERENCES portfolios(id),
@@ -247,17 +270,24 @@ def migrate_ledger_schema(path):
         raw.execute("INSERT INTO settings SELECT 1, capital_minor FROM __legacy_settings WHERE id=1")
         raw.execute("INSERT INTO positions SELECT 1, symbol, allocation_minor FROM __legacy_positions")
         raw.execute("INSERT INTO history SELECT id, 1, event, created_at FROM __legacy_history")
-        raw.execute("INSERT INTO paper_start SELECT 1, snapshot FROM __legacy_paper_start")
-        raw.execute("INSERT INTO paper_operations SELECT id, 1, operation FROM __legacy_paper_operations")
-        raw.execute("INSERT INTO paper_sales SELECT 1, operation_id, symbol, receipt FROM __legacy_paper_sales")
-        raw.execute("INSERT INTO paper_risk SELECT 1, config FROM __legacy_paper_risk")
-        raw.execute("INSERT INTO paper_equity SELECT id, 1, observed_at, day, equity_uah FROM __legacy_paper_equity")
-        raw.execute("""INSERT INTO paper_observations
-            SELECT 1, slot, observed_at, status, reason, equity_uah,
-                   max_drawdown_percent, daily_pnl_percent FROM __legacy_paper_observations""")
+        if "paper_start" in renamed:
+            raw.execute("INSERT INTO paper_start SELECT 1, snapshot FROM __legacy_paper_start")
+        if "paper_operations" in renamed:
+            raw.execute("INSERT INTO paper_operations SELECT id, 1, operation FROM __legacy_paper_operations")
+        if "paper_sales" in renamed:
+            raw.execute("INSERT INTO paper_sales SELECT 1, operation_id, symbol, receipt FROM __legacy_paper_sales")
+        if "paper_risk" in renamed:
+            raw.execute("INSERT INTO paper_risk SELECT 1, config FROM __legacy_paper_risk")
+        if "paper_equity" in renamed:
+            raw.execute("INSERT INTO paper_equity SELECT id, 1, observed_at, day, equity_uah FROM __legacy_paper_equity")
+        if "paper_observations" in renamed:
+            raw.execute("""INSERT INTO paper_observations
+                SELECT 1, slot, observed_at, status, reason, equity_uah,
+                       max_drawdown_percent, daily_pnl_percent FROM __legacy_paper_observations""")
         for table in ("settings", "positions", "history", "paper_start", "paper_operations",
                       "paper_sales", "paper_risk", "paper_equity", "paper_observations"):
-            raw.execute(f'DROP TABLE "__legacy_{table}"')
+            if table in renamed:
+                raw.execute(f'DROP TABLE "__legacy_{table}"')
         raw.commit()
     except Exception:
         raw.rollback()

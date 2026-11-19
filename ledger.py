@@ -28,6 +28,12 @@ class OperationConflict(Exception):
     pass
 
 
+class LedgerSchemaMismatch(Exception):
+    """Raised when the legacy Ledger is used with the migrated multi-portfolio schema."""
+
+    pass
+
+
 def now():
     return datetime.now(timezone.utc)
 
@@ -70,17 +76,64 @@ def fresh(timestamp):
 
 
 class Ledger:
-    def __init__(self, path, fetch=fetch_public, fee_override=None):
+    def __init__(self, path, fetch=fetch_public, fee_override=None, portfolio_id=1):
         self.path = path
         self.fetch = fetch
+        self.portfolio_id = portfolio_id
         self._balance_lock = Lock()
         self._previous_balance = None
         self.fee_override = number(fee_override) if fee_override is not None else None
         if self.fee_override is not None and self.fee_override >= 100:
             raise ValueError("Taker fee percent must be less than 100")
 
+    def _migrated(self):
+        with closing(sqlite3.connect(self.path)) as db:
+            return "portfolio_id" in {row[1] for row in db.execute("PRAGMA table_info(settings)")}
+
+    def _ensure_legacy_writable(self):
+        if self._migrated():
+            raise LedgerSchemaMismatch(
+                "Write operations require the portfolio-aware Ledger adapter; migrated schema is read-only here"
+            )
+
+    def _read_only_history(self):
+        plan = read_portfolio(self.path, self.portfolio_id)
+        with closing(sqlite3.connect(self.path)) as db:
+            start = db.execute("SELECT snapshot FROM paper_start WHERE portfolio_id = ?", (self.portfolio_id,)).fetchone()
+            operations = [json.loads(row[0]) for row in db.execute(
+                "SELECT operation FROM paper_operations WHERE portfolio_id = ? ORDER BY id", (self.portfolio_id,)
+            )]
+            receipts = [json.loads(row[0]) for row in db.execute(
+                "SELECT receipt FROM paper_sales WHERE portfolio_id = ? ORDER BY operation_id", (self.portfolio_id,)
+            )]
+            risk_row = db.execute("SELECT config FROM paper_risk WHERE portfolio_id = ?", (self.portfolio_id,)).fetchone()
+        risk = json.loads(risk_row[0]) if risk_row else DEFAULT_RISK.copy()
+        extra = dict(risk=risk, revision=len(receipts), realized_pnl_uah="0", holdings=[],
+                     operations=operations, observations=self.observation_history())
+        if start is None:
+            cash_key = "cash_usdt" if plan["currency"] == "USDT" else "cash_uah"
+            return dict(started=False, currency=plan["currency"], **{cash_key: str(Decimal(plan["initial_capital_minor"]) / (Decimal(10) ** plan["scale"]))}, **extra)
+        snapshot = json.loads(start[0])
+        holdings = {op["symbol"]: dict(op, basis_uah=op.get("debit_uah", "0")) for op in operations}
+        realized = ZERO
+        for receipt in receipts:
+            for sale in receipt.get("sales", []):
+                if sale["symbol"] not in holdings:
+                    continue
+                holding = holdings[sale["symbol"]]
+                holding["quantity"] = sale["remaining_quantity"]
+                holding["basis_uah"] = sale.get("remaining_basis_uah", "0")
+                realized += Decimal(sale.get("realized_pnl_uah", "0"))
+        extra.update(realized_pnl_uah=str(realized), holdings=[op for op in holdings.values() if number(op.get("quantity", "0")) > 0])
+        return dict(started=True, **snapshot, **extra)
+
     def initialize(self):
         with closing(sqlite3.connect(self.path)) as db, db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(settings)")}
+            if "portfolio_id" in columns:
+                raise LedgerSchemaMismatch(
+                    "Ledger requires portfolio-aware adapter for migrated schema; no automatic migration is performed"
+                )
             db.execute("BEGIN IMMEDIATE")
             db.execute("""CREATE TABLE IF NOT EXISTS paper_start (
                 id INTEGER PRIMARY KEY CHECK (id = 1), snapshot TEXT NOT NULL
@@ -111,6 +164,7 @@ class Ledger:
         return json.loads(row[0]) if row else DEFAULT_RISK.copy()
 
     def configure(self, **changes):
+        self._ensure_legacy_writable()
         if set(changes) - DEFAULT_RISK.keys():
             raise ValueError("Unknown risk setting")
         for key, value in changes.items():
@@ -128,6 +182,8 @@ class Ledger:
         return config
 
     def history(self):
+        if self._migrated():
+            return self._read_only_history()
         self.initialize()
         capital = Decimal(read_portfolio(self.path)["initial_capital_minor"]) / 100
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -200,6 +256,7 @@ class Ledger:
             raise MarketUnavailable(f"{pair}: order book unavailable or stale") from error
 
     def start(self):
+        self._ensure_legacy_writable()
         existing = self.history()
         if existing["started"]:
             return existing
@@ -299,6 +356,14 @@ class Ledger:
         return dict(journal, valuation=decode(valuation), warning=None)
 
     def observation_history(self):
+        if self._migrated():
+            with closing(sqlite3.connect(self.path)) as db:
+                rows = db.execute("""SELECT slot, observed_at, status, reason, equity_uah,
+                    max_drawdown_percent, daily_pnl_percent FROM paper_observations
+                    WHERE portfolio_id = ? ORDER BY slot""", (self.portfolio_id,)).fetchall()
+            keys = ("slot", "observed_at", "status", "reason", "equity_uah",
+                    "max_drawdown_percent", "daily_pnl_percent")
+            return [dict(zip(keys, row)) for row in rows]
         self.initialize()
         with closing(sqlite3.connect(self.path)) as db:
             rows = db.execute("""SELECT slot, observed_at, status, reason, equity_uah,
@@ -309,6 +374,7 @@ class Ledger:
         return [dict(zip(keys, row)) for row in rows]
 
     def record_skip(self, reason, slot=None, status="unavailable"):
+        self._ensure_legacy_writable()
         stamp = now()
         slot = slot or stamp.replace(second=0, microsecond=0).isoformat()
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -318,6 +384,7 @@ class Ledger:
         return {"status": status if inserted else "duplicate", "reason": reason}
 
     def record_valuation(self, slot=None):
+        self._ensure_legacy_writable()
         journal = self.history()
         if not journal["started"]:
             return self.record_skip("Virtual trading has not started", slot)
@@ -487,6 +554,7 @@ class Ledger:
                     quote_timestamp=book["timestamp"], received_at=book["received_at"], source=book["source"])
 
     def sell(self, symbol, operation_id, fingerprint):
+        self._ensure_legacy_writable()
         self.initialize()
         with closing(sqlite3.connect(self.path)) as db:
             existing = self.sale_receipt(db, operation_id, symbol)

@@ -15,8 +15,9 @@ from portfolio import (
     record_portfolio_observation,
     read_portfolio_for,
     migrate_ledger_schema,
+    read_portfolio,
 )
-from ledger import Ledger
+from ledger import Ledger, LedgerSchemaMismatch
 
 
 class PortfolioTests(unittest.TestCase):
@@ -98,6 +99,43 @@ class PortfolioTests(unittest.TestCase):
             db.execute("INSERT INTO paper_risk (portfolio_id, config) VALUES (?, ?)", (other["id"], '{}'))
             self.assertEqual(db.execute("SELECT COUNT(*) FROM paper_risk WHERE portfolio_id=1").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM paper_risk WHERE portfolio_id=?", (other["id"],)).fetchone()[0], 1)
+
+    def test_legacy_ledger_refuses_migrated_schema_instead_of_mixing_data(self):
+        migrate_ledger_schema(self.path)
+        with self.assertRaises(LedgerSchemaMismatch):
+            Ledger(self.path, portfolio_id=1).initialize()
+
+    def test_read_only_ledger_history_isolated_for_two_migrated_portfolios(self):
+        migrate_portfolios(self.path)
+        other = create_portfolio(self.path, "USDT", "USDT", "1", "usdt")
+        Ledger(self.path).initialize()
+        migrate_ledger_schema(self.path)
+        with closing(connect(self.path)) as db, db:
+            db.execute("INSERT INTO settings (portfolio_id, capital_minor) VALUES (?, ?)", (other["id"], 1000000))
+            db.execute("INSERT INTO positions VALUES (?, ?, ?)", (other["id"], "BTC", 1000000))
+            db.execute("INSERT INTO paper_start VALUES (?, ?)", (1, '{"cash_uah":"10000","initial_uah":"10000","initial_usdt":"250"}'))
+            db.execute("INSERT INTO paper_start VALUES (?, ?)", (other["id"], '{"cash_usdt":"1","initial_usdt":"1"}'))
+            db.execute("INSERT INTO paper_operations VALUES (?, ?, ?)", (1, 1, '{"symbol":"BTC"}'))
+            db.execute("INSERT INTO paper_operations VALUES (?, ?, ?)", (2, other["id"], '{"symbol":"BTC"}'))
+            db.execute("INSERT INTO paper_observations (portfolio_id, slot, observed_at, status, reason) VALUES (?, ?, ?, ?, ?)", (1, "a", "t", "recorded", "legacy"))
+            db.execute("INSERT INTO paper_observations (portfolio_id, slot, observed_at, status, reason) VALUES (?, ?, ?, ?, ?)", (other["id"], "a", "t", "recorded", "other"))
+        self.assertEqual(read_portfolio(self.path, 1)["currency"], "UAH")
+        self.assertEqual(read_portfolio(self.path, other["id"])["currency"], "USDT")
+        self.assertEqual([op["symbol"] for op in Ledger(self.path, portfolio_id=1).history()["operations"]], ["BTC"])
+        self.assertEqual([op["symbol"] for op in Ledger(self.path, portfolio_id=other["id"]).history()["operations"]], ["BTC"])
+        self.assertEqual(Ledger(self.path, portfolio_id=1).observation_history()[0]["reason"], "legacy")
+        self.assertEqual(Ledger(self.path, portfolio_id=other["id"]).observation_history()[0]["reason"], "other")
+
+    def test_read_only_ledger_rejects_unknown_migrated_portfolio(self):
+        migrate_ledger_schema(self.path)
+        with self.assertRaises(ValueError):
+            Ledger(self.path, portfolio_id=999).history()
+
+    def test_migrated_read_only_ledger_refuses_financial_writes(self):
+        migrate_ledger_schema(self.path)
+        ledger = Ledger(self.path, portfolio_id=1)
+        with self.assertRaises(LedgerSchemaMismatch):
+            ledger.start()
 
 
 if __name__ == "__main__":
