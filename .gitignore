@@ -79,6 +79,8 @@ __pycache__/
 .codex/
 logs/
 *.log
+desktop/**/bin/
+desktop/**/obj/
 tmp/
 temp/
 *.tmp
