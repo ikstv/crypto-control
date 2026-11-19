@@ -18,6 +18,7 @@ from portfolio import (
     read_portfolio,
 )
 from ledger import Ledger, LedgerSchemaMismatch
+from test_ledger import feed
 
 
 class PortfolioTests(unittest.TestCase):
@@ -135,7 +136,41 @@ class PortfolioTests(unittest.TestCase):
         migrate_ledger_schema(self.path)
         ledger = Ledger(self.path, portfolio_id=1)
         with self.assertRaises(LedgerSchemaMismatch):
-            ledger.start()
+            ledger.sell("BTC", "sale", "0" * 64)
+
+    def _migrated_with_usdt(self):
+        migrate_portfolios(self.path)
+        other = create_portfolio(self.path, "USDT", "USDT", "1000", "usdt-start")
+        Ledger(self.path).initialize()
+        migrate_ledger_schema(self.path)
+        with closing(connect(self.path)) as db, db:
+            db.execute("INSERT INTO settings (portfolio_id, capital_minor) VALUES (?, ?)", (other["id"], 1000000000))
+            db.execute("INSERT INTO positions VALUES (?, ?, ?)", (other["id"], "BTC", 1000000000))
+        return other["id"]
+
+    def test_migrated_start_isolated_for_uah_and_usdt(self):
+        other_id = self._migrated_with_usdt()
+        uah = Ledger(self.path, feed, portfolio_id=1).start()
+        usdt = Ledger(self.path, feed, portfolio_id=other_id).start()
+        self.assertTrue(uah["started"])
+        self.assertTrue(usdt["started"])
+        self.assertEqual(Ledger(self.path, feed, portfolio_id=1).start(), uah)
+        self.assertEqual(Ledger(self.path, feed, portfolio_id=other_id).start(), usdt)
+        self.assertEqual(len(Ledger(self.path, portfolio_id=1).history()["operations"]), 1)
+        self.assertEqual(len(Ledger(self.path, portfolio_id=other_id).history()["operations"]), 1)
+
+    def test_migrated_start_unknown_portfolio_does_not_write(self):
+        self._migrated_with_usdt()
+        with self.assertRaises(ValueError):
+            Ledger(self.path, feed, portfolio_id=999).start()
+        with closing(connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM paper_start").fetchone()[0], 0)
+
+    def test_migrated_usdt_start_does_not_require_fx(self):
+        other_id = self._migrated_with_usdt()
+        no_fx = lambda endpoint: feed(endpoint, fx=False)
+        result = Ledger(self.path, no_fx, portfolio_id=other_id).start()
+        self.assertTrue(result["started"])
 
 
 if __name__ == "__main__":

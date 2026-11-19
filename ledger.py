@@ -256,6 +256,8 @@ class Ledger:
             raise MarketUnavailable(f"{pair}: order book unavailable or stale") from error
 
     def start(self):
+        if self._migrated():
+            return self._start_migrated()
         self._ensure_legacy_writable()
         existing = self.history()
         if existing["started"]:
@@ -337,6 +339,81 @@ class Ledger:
                           (exact_json(snapshot),)).rowcount:
                 db.executemany("INSERT INTO paper_operations (operation) VALUES (?)",
                                [(exact_json(op),) for op in operations])
+        return self.history()
+
+    def _start_migrated(self):
+        """Start one migrated portfolio; sales and valuation remain read-only."""
+        plan = read_portfolio(self.path, self.portfolio_id)
+        existing = self.history()
+        if existing["started"]:
+            return existing
+        currency = plan["currency"]
+        scale = plan["scale"]
+        capital = Decimal(plan["initial_capital_minor"]) / (Decimal(10) ** scale)
+        cash = capital
+        markets = self.markets()
+        fx = fx_market = fx_fee = None
+        if currency == "UAH":
+            fx_market = markets.get(FX)
+            if fx_market is None:
+                raise MarketUnavailable("USDT/UAH spot market unavailable")
+            fx = self.book(FX)
+            fx_fee = self.fee(fx_market)
+            fx_cost = fx["ask"] / (1 - fx_fee)
+        else:
+            fx_cost = Decimal(1)
+        operations = []
+        for position in plan["positions"]:
+            symbol = position["symbol"]
+            pair = f"{symbol}_USDT"
+            try:
+                market = markets[pair]
+                book = self.book(pair)
+                fee = self.fee(market)
+                amount_step = max(Decimal(1).scaleb(-int(market["stockPrec"])), number(market.get("stepSize") or "0"))
+                price_step = max(Decimal(1).scaleb(-int(market["moneyPrec"])), number(market.get("tickSize") or "0"))
+                allocation = Decimal(position["allocation_minor"]) / (Decimal(10) ** scale)
+                budget = min(cash, allocation)
+                fills = buy_levels(book["asks"], budget / fx_cost, amount_step, price_step)
+                quantity = sum((units for _, units in fills), ZERO)
+                total = sum((price * units for price, units in fills), ZERO)
+                if (quantity <= 0 or quantity < number(market["minAmount"])
+                        or total < number(market["minTotal"])):
+                    raise ValueError("Order is outside market size limits")
+                if currency == "UAH":
+                    debit = (total * fx_cost).quantize(CENT, rounding=ROUND_UP)
+                else:
+                    debit = total.quantize(Decimal("0.000001"), rounding=ROUND_UP)
+                if debit > budget:
+                    raise ValueError("Debit exceeds allocation")
+            except (KeyError, MarketUnavailable, ValueError, InvalidOperation, OverflowError) as error:
+                continue
+            cash -= debit
+            base_fee = quantity * fee
+            operation = dict(time=now().isoformat(), side="buy", symbol=symbol, pair=pair,
+                             price=total / quantity, fills=[dict(price=p, quantity=q) for p, q in fills],
+                             gross_quantity=quantity, quantity=quantity - base_fee, fee_base=base_fee,
+                             fee_rate=fee, fee_asset=symbol, total_usdt=total,
+                             cash_after=(cash), quote_timestamp=book["timestamp"],
+                             quote_received_at=book["received_at"], source=book["source"])
+            operation["debit_uah" if currency == "UAH" else "debit_usdt"] = debit
+            operations.append(operation)
+        if not operations:
+            raise MarketUnavailable("No eligible purchases")
+        if (fx is not None and not fresh(fx["timestamp"])) or any(
+                not fresh(op["quote_timestamp"]) for op in operations):
+            raise MarketUnavailable("Quotes expired before saving")
+        snapshot = {"currency": currency, "cash_uah" if currency == "UAH" else "cash_usdt": cash,
+                    "initial_uah" if currency == "UAH" else "initial_usdt": capital,
+                    "skipped": {}}
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM paper_start WHERE portfolio_id = ?", (self.portfolio_id,)).fetchone():
+                return self.history()
+            db.execute("INSERT INTO paper_start (portfolio_id, snapshot) VALUES (?, ?)",
+                       (self.portfolio_id, exact_json(snapshot)))
+            db.executemany("INSERT INTO paper_operations (portfolio_id, operation) VALUES (?, ?)",
+                           [(self.portfolio_id, exact_json(op)) for op in operations])
         return self.history()
 
     def state(self):

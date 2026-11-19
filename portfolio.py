@@ -74,6 +74,7 @@ def read_portfolio(path, portfolio_id=None):
     allocated = sum(position["allocation_minor"] for position in positions)
     return {
         "currency": currency,
+        "scale": 2 if currency == "UAH" else 6,
         "initial_capital_minor": capital,
         "allocated_minor": allocated,
         "unallocated_minor": capital - allocated,
