@@ -218,9 +218,11 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3", start_workers=T
         return {"observations": portfolio_ledger(portfolio_id).observation_history()}
 
     @app.get("/api/v1/portfolios/{portfolio_id}/paper/sale-preview")
-    def portfolio_sale_preview(portfolio_id: int, symbol: SaleSymbol) -> dict:
+    def portfolio_sale_preview(portfolio_id: int, symbol: SaleSymbol, quantity: Decimal | None = None) -> dict:
         try:
-            return portfolio_ledger(portfolio_id).preview(symbol)
+            return portfolio_ledger(portfolio_id).preview(symbol, quantity=quantity)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
         except MarketUnavailable as error:
             raise HTTPException(503, str(error)) from error
 
@@ -232,6 +234,8 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3", start_workers=T
                                                        body.fingerprint, body.quantity)
         except OperationConflict as error:
             raise HTTPException(409, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
         except MarketUnavailable as error:
             raise HTTPException(503, str(error)) from error
 

@@ -49,7 +49,7 @@ class EquityTests(TestCase):
         ledger.start()
         ledger.record_valuation()
         self.stamp += timedelta(minutes=4)
-        ledger.sell("BTC", "part", ledger.preview("BTC")["fingerprint"], quantity=D("1"))
+        ledger.sell("BTC", "part", ledger.preview("BTC", quantity=D("1"))["fingerprint"], quantity=D("1"))
         self.stamp += timedelta(minutes=1)
         partial = ledger.state()["valuation"]
         ledger.record_valuation()
@@ -241,7 +241,7 @@ class EquityTests(TestCase):
         ledger.start()
         ledger.record_valuation()
         self.stamp += timedelta(minutes=4)
-        ledger.sell("BTC", "old", ledger.preview("BTC")["fingerprint"], quantity=D("1"))
+        ledger.sell("BTC", "old", ledger.preview("BTC", quantity=D("1"))["fingerprint"], quantity=D("1"))
         with closing(connect(self.path)) as db, db:
             db.execute("UPDATE paper_sales SET receipt=json_remove(receipt, '$.sales[0].time')")
         self.stamp += timedelta(minutes=1)

@@ -742,9 +742,9 @@ class Ledger:
             stats[f"equity_{currency.lower()}"] = equity
         return stats
 
-    def preview(self, symbol):
+    def preview(self, symbol, quantity=None):
         if self._migrated():
-            return self._preview_migrated(symbol)
+            return self._preview_migrated(symbol, requested=quantity)
         journal = self.history()
         holdings = [op for op in journal["holdings"] if symbol in ("all", op["symbol"])]
         if not holdings:
@@ -777,7 +777,11 @@ class Ledger:
                            fx=dict(fx, pair=FX, direction="USDT_to_UAH", fee_rate=fx_fee),
                            fingerprint=fingerprint))
 
-    def _preview_migrated(self, symbol, journal=None):
+    def _preview_migrated(self, symbol, journal=None, requested=None):
+        if requested is not None:
+            requested = number(requested).normalize()
+            if not requested or symbol == "all":
+                raise ValueError("Specify a positive quantity for one asset")
         if journal is None:
             journal = self._journal()
         holdings = [op for op in journal["holdings"] if symbol in ("all", op["symbol"])]
@@ -800,7 +804,12 @@ class Ledger:
             fee = self.fee(market)
             step = max(Decimal(1).scaleb(-int(market["stockPrec"])), number(market.get("stepSize") or "0"))
             available = number(holding["quantity"])
-            quantity = floor_step(min(available, book["bid_size"]), step)
+            if requested is not None and requested > available:
+                raise ValueError("Quantity exceeds the position balance")
+            if requested is not None and requested % step:
+                raise ValueError("Quantity does not match the market step")
+            target = available if requested is None else requested
+            quantity = floor_step(min(target, book["bid_size"]), step)
             total = quantity * book["bid"]
             if quantity < number(market["minAmount"]) or total < number(market["minTotal"]):
                 quantity = ZERO
@@ -821,7 +830,7 @@ class Ledger:
                               quote_timestamp=book["timestamp"], received_at=book["received_at"],
                               source=book["source"], warning=None if quantity == available else "Partial fill"))
         terms = [[sale["symbol"], sale["quantity"], sale["net_currency"]] for sale in sales]
-        fingerprint = hashlib.sha256(exact_json([journal["revision"], symbol, terms]).encode()).hexdigest()
+        fingerprint = hashlib.sha256(exact_json([journal["revision"], symbol, requested, terms]).encode()).hexdigest()
         return decode(dict(symbol=symbol, revision=journal["revision"], sales=sales,
                            currency=currency, fx=fx, fingerprint=fingerprint))
 
@@ -920,7 +929,7 @@ class Ledger:
             if existing:
                 return existing
             try:
-                preview = self.preview(symbol)
+                preview = self.preview(symbol, quantity=quantity) if quantity is not None else self.preview(symbol)
             except MarketUnavailable:
                 # A concurrent retry may already have closed the last position.
                 existing = prior_receipt()
@@ -943,8 +952,7 @@ class Ledger:
             sales = []
             fx_used = ZERO
             for sale in preview["sales"]:
-                available_sale = number(sale["quantity"])
-                units = available_sale if quantity is None else min(available_sale, quantity)
+                units = number(sale["quantity"])
                 if units <= 0:
                     continue
                 if not fresh(sale["quote_timestamp"]):

@@ -188,6 +188,37 @@ class PortfolioTests(unittest.TestCase):
         with closing(connect(self.path)) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM paper_operations").fetchone()[0], 0)
 
+    def test_explicit_uah_sale_uses_only_its_own_fx_depth(self):
+        other_id = self._migrated_with_usdt()
+        ledger = Ledger(self.path, feed, portfolio_id=1)
+        ledger.start()
+        other = Ledger(self.path, feed, portfolio_id=other_id).history()
+
+        def thin_fx(endpoint):
+            data = feed(endpoint)
+            if "USDT_UAH" in endpoint:
+                data["bids"] = [["40", "5"]]
+            return data
+
+        ledger.fetch = thin_fx
+        before = ledger.history()
+        for quantity in (None, Decimal(".1")):
+            with self.assertRaises(MarketUnavailable):
+                ledger.preview("BTC", quantity=quantity)
+        for quantity in map(Decimal, ("0", "-1", "1")):
+            with self.assertRaises(ValueError):
+                ledger.preview("BTC", quantity=quantity)
+        self.assertEqual(ledger.history(), before)
+        quantity = Decimal(".05")
+        quote = ledger.preview("BTC", quantity=quantity)
+        receipt = ledger.sell("BTC", "small-fx", quote["fingerprint"], quantity)
+        for key in ("quantity", "net_currency", "realized_pnl", "fx_fee_uah"):
+            self.assertEqual(receipt["sales"][0][key], quote["sales"][0][key])
+        reopened = Ledger(self.path, thin_fx, portfolio_id=1)
+        self.assertEqual(reopened.sell("BTC", "small-fx", "ignored", quantity), receipt)
+        self.assertEqual(Decimal(reopened.history()["cash_uah"]), Decimal(before["cash_uah"]) + Decimal("197.60"))
+        self.assertEqual(Ledger(self.path, feed, portfolio_id=other_id).history(), other)
+
     def test_migrated_usdt_partial_and_full_sales_isolated(self):
         other_id = self._migrated_with_usdt()
         ledger = Ledger(self.path, feed, portfolio_id=other_id)
@@ -195,6 +226,7 @@ class PortfolioTests(unittest.TestCase):
         preview = ledger.preview("BTC")
         self.assertGreater(Decimal(preview["sales"][0]["quantity"]), 0)
         partial = Decimal(preview["sales"][0]["quantity"]) / 2
+        preview = ledger.preview("BTC", quantity=partial)
         first = ledger.sell("BTC", "sale-1", preview["fingerprint"], quantity=partial)
         again = ledger.sell("BTC", "sale-1", preview["fingerprint"], quantity=partial)
         self.assertEqual(first, again)

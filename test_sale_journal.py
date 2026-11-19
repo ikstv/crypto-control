@@ -47,7 +47,7 @@ class SaleJournalTests(TestCase):
         ledger = self.usdt_ledger()
         other = self.usdt_ledger("Second USDT")
         other_before = other.history()
-        preview = ledger.preview("BTC")
+        preview = ledger.preview("BTC", quantity=Decimal("1"))
         first = ledger.sell("BTC", "z-first", preview["fingerprint"], Decimal("1"))
         preview = ledger.preview("BTC")
         last = ledger.sell("BTC", "a-last", preview["fingerprint"])
@@ -73,7 +73,7 @@ class SaleJournalTests(TestCase):
     def test_partial_receipt_matches_executed_quantity_and_retry_intent(self):
         migrate_ledger_schema(self.path)
         ledger = self.usdt_ledger()
-        receipt = ledger.sell("BTC", "part", ledger.preview("BTC")["fingerprint"], Decimal("1"))
+        receipt = ledger.sell("BTC", "part", ledger.preview("BTC", quantity=Decimal("1"))["fingerprint"], Decimal("1"))
         sale, = receipt["sales"]
         self.assertEqual(Decimal(sale["fee_usdt"]), Decimal("0.099"))
         self.assertEqual(Decimal(sale["net_usdt"]), Decimal("98.901"))
@@ -90,7 +90,7 @@ class SaleJournalTests(TestCase):
         migrate_ledger_schema(self.path)
         ledger = Ledger(self.path, lambda endpoint: feed(endpoint, bid="100"))
         ledger.start()
-        sale, = ledger.sell("BTC", "part", ledger.preview("BTC")["fingerprint"],
+        sale, = ledger.sell("BTC", "part", ledger.preview("BTC", quantity=Decimal(".1"))["fingerprint"],
                             Decimal("0.1"))["sales"]
         self.assertEqual(Decimal(sale["net_currency"]), Decimal("399.20"))
         self.assertEqual(Decimal(sale["cost_basis"]), Decimal("400.80"))
