@@ -80,6 +80,8 @@
     <button type="button" data-algorithm="stop">Зупинити алгоритм</button>
     <button type="button" data-algorithm="emergency">Аварійна зупинка</button>
     <button type="button" data-algorithm="reset">Зняти блокування</button>
+    <h3>Спостереження BTC/USDT · денна SMA 10/30</h3>
+    <p id="shadow-status" role="status"></p>
   </section>
 </main>
 <script>
@@ -99,7 +101,7 @@
           : await fetch(url, {cache: "no-store"});
         if (!response.ok) throw new Error();
         const {mode} = await response.json();
-        status.textContent = labels[mode] + ". Торгову стратегію ще не підключено.";
+        status.textContent = labels[mode] + ". Режим спостереження.";
       } catch {
         status.textContent = "Не вдалося підтвердити режим. Перевірте підключення та повторіть дію.";
       } finally {
@@ -113,6 +115,23 @@
       }
     }));
     update();
+    async function refreshShadow() {
+      const status = document.querySelector("#shadow-status");
+      try {
+        const response = await fetch("/api/v1/shadow/signals", {cache: "no-store"});
+        if (!response.ok) throw new Error();
+        const {mode, records} = await response.json();
+        const latest = records[0];
+        const day = latest && new Date(latest.candle_open * 1000).toISOString().slice(0, 10);
+        status.textContent = labels[mode] + ". " + (latest
+          ? day + " UTC · " + (latest.decision ?? "Пропущено") + " · " + latest.reason
+          : "Журнал сигналів порожній.");
+      } catch {
+        status.textContent = "Журнал сигналів недоступний.";
+      }
+    }
+    refreshShadow();
+    setInterval(refreshShadow, 15000);
   })();
 </script>
 <script>

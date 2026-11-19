@@ -1,4 +1,7 @@
 import asyncio
+import logging
+import sqlite3
+from shadow import Shadow, SOURCE
 from algorithm import Algorithm, Blocked
 import os
 from contextlib import asynccontextmanager, suppress
@@ -50,6 +53,19 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3"):
     quotes = Quotes()
     ledger = Ledger(db_path, fee_override=os.getenv("CRYPTO_CONTROL_TAKER_FEE_PERCENT"))
     algorithm = Algorithm(db_path)
+    shadow = Shadow(algorithm)
+
+    async def poll_shadow():
+        while True:
+            work = asyncio.create_task(asyncio.to_thread(shadow.poll))
+            try:
+                await asyncio.shield(work)
+            except asyncio.CancelledError:
+                await work
+                raise
+            except sqlite3.Error:
+                logging.exception("Shadow signal storage unavailable")
+            await asyncio.sleep(300)
 
     async def poll_quotes():
         while True:
@@ -62,15 +78,19 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3"):
         ledger.initialize()
         quote_worker = asyncio.create_task(poll_quotes())
         history_worker = asyncio.create_task(history_loop(ledger))
+        shadow_worker = asyncio.create_task(poll_shadow())
         try:
             yield
         finally:
             quote_worker.cancel()
             history_worker.cancel()
+            shadow_worker.cancel()
             with suppress(asyncio.CancelledError):
                 await quote_worker
             with suppress(asyncio.CancelledError):
                 await history_worker
+            with suppress(asyncio.CancelledError):
+                await shadow_worker
 
     app = FastAPI(title="Crypto Control", version="1.0.0", lifespan=lifespan)
 
@@ -81,6 +101,10 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3"):
     @app.get("/api/v1/algorithm/history")
     def algorithm_history():
         return {"changes": algorithm.history()}
+
+    @app.get("/api/v1/shadow/signals")
+    def shadow_signals():
+        return {"mode": algorithm.status(), "source": SOURCE, "records": shadow.history()}
 
     @app.post("/api/v1/algorithm/{action}")
     def algorithm_change(action: Literal["activate", "stop", "emergency", "reset"],

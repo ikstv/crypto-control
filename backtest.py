@@ -42,8 +42,9 @@ class Costs:
 def fetch_candles(start, end):
     # WhiteBIT's daily response ends before the UTC bucket containing its end
     # parameter. Advance that boundary one bucket and validate returned starts.
+    request_end = min(end + DAY - 1, int(datetime.now(timezone.utc).timestamp()))
     params = urlencode(dict(market="BTC_USDT", interval="1d", start=start,
-                            end=end + DAY - 1, limit=(end - start) // DAY))
+                            end=request_end, limit=(end - start) // DAY))
     request = Request(f"{SOURCE}?{params}", headers={"User-Agent": "CryptoControl/1.0"})
     with urlopen(request, timeout=15) as response:
         payload = json.load(response)
