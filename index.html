@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="uk">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crypto Control</title>
+<style>
+  body { margin: 0; background: #101820; color: #eef3f6; font: 1rem system-ui, sans-serif; }
+  main { max-width: 44rem; margin: auto; padding: clamp(1rem, 5vw, 3rem); }
+  h1 { font-size: clamp(2rem, 6vw, 3rem); margin: 0; }
+  p { color: #b8c9d2; }
+  section { background: #192631; border-radius: 1rem; padding: 1rem; }
+  section + section { margin-top: 1rem; }
+  .table-scroll { overflow-x: auto; }
+  strong { display: block; font-size: 2rem; color: #82ead1; }
+  table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+  th, td { text-align: left; padding: .75rem .25rem; border-bottom: 1px solid #344652; }
+  th:last-child, td:last-child { text-align: right; }
+</style>
+<main>
+  <h1>Crypto Control</h1>
+  <p>Демонстраційний портфель</p>
+  <section>
+    <h2>Віртуальна торгівля</h2>
+    <button id="paper-start" type="button" disabled>Почати віртуальну торгівлю</button>
+    <p id="paper-status" role="status"></p>
+    <p id="paper-error" role="alert"></p>
+    <dl id="paper-totals"></dl>
+    <div id="sale-actions"></div>
+    <div id="sale-preview" hidden>
+      <h3>Попередня оцінка продажу</h3>
+      <ul id="sale-lines"></ul>
+      <p id="sale-total"></p>
+      <button id="sale-confirm" type="button">Підтвердити віртуальний продаж</button>
+      <button id="sale-cancel" type="button">Скасувати</button>
+    </div>
+    <details>
+      <summary>Пауза й пороги сповіщень</summary>
+      <form id="risk-form">
+        <p><label><input type="checkbox" name="paused"> Пауза нових покупок</label></p>
+        <p><label>Денний збиток, % <input type="number" min="0.01" max="100" step="0.01" name="daily_loss_percent" required></label></p>
+        <p><label>Максимальна просадка, % <input type="number" min="0.01" max="100" step="0.01" name="drawdown_percent" required></label></p>
+        <p><label>Ціль прибутку, % <input type="number" min="0.01" max="100" step="0.01" name="target_percent" required></label></p>
+        <button type="submit" disabled>Зберегти налаштування</button>
+      </form>
+    </details>
+    <details id="paper-history" hidden>
+      <summary>Журнал операцій і джерела розрахунків</summary>
+      <ul id="paper-operations"></ul>
+      <pre id="paper-audit" class="table-scroll"></pre>
+    </details>
+  </section>
+  <p id="status" role="status">Завантаження портфеля…</p>
+  <section id="portfolio" hidden>
+    Початковий капітал
+    <strong id="capital"></strong>
+    <table>
+      <thead><tr><th scope="col">Актив</th><th scope="col">План розподілу</th></tr></thead>
+      <tbody id="positions"></tbody>
+    </table>
+  </section>
+  <section>
+    <h2>Котирування WhiteBIT</h2>
+    <p id="quote-status" role="status">Завантаження котирувань…</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th scope="col">Пара</th><th scope="col">Ціна, USDT</th><th scope="col">Отримано</th><th scope="col">Стан</th></tr></thead>
+        <tbody id="quotes"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script>
+  async function loadPortfolio() {
+    const status = document.querySelector("#status");
+    try {
+      const response = await fetch("/api/v1/portfolio", {cache: "no-store"});
+      if (!response.ok) throw new Error("Portfolio unavailable");
+      const data = await response.json();
+      const format = new Intl.NumberFormat("uk-UA", {style: "currency", currency: data.currency});
+      document.querySelector("#capital").textContent = format.format(data.initial_capital_minor / 100);
+      const positions = document.querySelector("#positions");
+      for (const position of data.positions) {
+        const row = positions.insertRow();
+        row.insertCell().textContent = position.symbol;
+        row.insertCell().textContent = format.format(position.allocation_minor / 100);
+      }
+      document.querySelector("#portfolio").hidden = false;
+      status.textContent = "";
+    } catch {
+      status.textContent = "Не вдалося завантажити портфель. Перевірте локальний сервер і оновіть сторінку.";
+    }
+  }
+  loadPortfolio();
+  const connectionLabels = {
+    loading: "Очікуємо дані WhiteBIT",
+    connected: "WhiteBIT на зв’язку",
+    timeout: "WhiteBIT не відповів вчасно",
+    offline: "Немає з’єднання з WhiteBIT",
+    rate_limited: "WhiteBIT обмежив частоту запитів",
+    http_error: "Помилка HTTP від WhiteBIT",
+    invalid_response: "Некоректна відповідь WhiteBIT",
+  };
+  const quoteLabels = {
+    fresh: "Актуальна",
+    stale: "Застаріла",
+    market_unavailable: "Пара недоступна",
+    no_quote: "Немає даних",
+  };
+  async function loadQuotes() {
+    const status = document.querySelector("#quote-status");
+    const table = document.querySelector("#quotes");
+    try {
+      const response = await fetch("/api/v1/quotes", {cache: "no-store"});
+      if (!response.ok) throw new Error("Quotes unavailable");
+      const data = await response.json();
+      const rows = document.createDocumentFragment();
+      for (const quote of data.quotes) {
+        const row = rows.appendChild(document.createElement("tr"));
+        row.insertCell().textContent = quote.pair.replace("_", "/");
+        row.insertCell().textContent = quote.price ?? "—";
+        row.insertCell().textContent = quote.received_at
+          ? new Date(quote.received_at).toLocaleString("uk-UA") : "—";
+        row.insertCell().textContent = quoteLabels[quote.status];
+      }
+      table.replaceChildren(rows);
+      status.textContent = connectionLabels[data.connection];
+    } catch {
+      table.replaceChildren();
+      status.textContent = "Не вдалося отримати котирування від локального сервера";
+    }
+    setTimeout(loadQuotes, 5000);
+  }
+  loadQuotes();
+  const start = document.querySelector("#paper-start");
+  const paperStatus = document.querySelector("#paper-status");
+  const paperError = document.querySelector("#paper-error");
+  const totals = document.querySelector("#paper-totals");
+  let paperGeneration = 0;
+  let starting = false;
+  let pendingSale = null;
+  let busySale = false;
+  const saleActions = document.querySelector("#sale-actions");
+  const previewBox = document.querySelector("#sale-preview");
+  const confirmSale = document.querySelector("#sale-confirm");
+  const cancelSale = document.querySelector("#sale-cancel");
+  const riskForm = document.querySelector("#risk-form");
+  const writeHeaders = {"Content-Type": "application/json", "X-Crypto-Control": "paper-start"};
+  const display = (value, places = 2) =>
+    value == null ? "—" : new Intl.NumberFormat("uk-UA", {maximumFractionDigits: places}).format(value);
+
+  async function paperRequest(path, options = {}) {
+    const response = await fetch("/api/v1/paper" + path, {cache: "no-store", ...options});
+    const data = await response.json();
+    if (!response.ok) throw Object.assign(new Error(data.detail), {status: response.status});
+    return data;
+  }
+
+  async function openPreview(symbol) {
+    busySale = true;
+    paperError.textContent = "";
+    saleActions.querySelectorAll("button").forEach(button => button.disabled = true);
+    try {
+      const preview = await paperRequest("/sale-preview?symbol=" + symbol);
+      pendingSale = {symbol, fingerprint: preview.fingerprint, operation_id: crypto.randomUUID()};
+      const list = document.querySelector("#sale-lines");
+      list.replaceChildren();
+      for (const sale of preview.sales) {
+        const item = document.createElement("li");
+        const parts = [
+          `${sale.symbol}: доступно ${sale.available_quantity}, до продажу ${sale.quantity}, залишок ${sale.remaining_quantity}`,
+          sale.bid && `bid ${sale.bid} USDT, спред ${sale.spread} USDT, глибина ${sale.bid_depth} (${sale.bid_levels} рівнів)`,
+          sale.fee_usdt && `комісії ${sale.fee_usdt} USDT + ${display(sale.fx_fee_uah, 6)} грн, чистими ${display(sale.net_uah)} грн`,
+          sale.warning,
+        ];
+        item.textContent = parts.filter(Boolean).join(" · ");
+        list.append(item);
+      }
+      document.querySelector("#sale-total").textContent =
+        `Очікувані надходження: ${display(preview.net_uah)} грн · курс bid ${preview.fx.bid} грн/USDT`;
+      confirmSale.disabled = !preview.sales.some(row => Number(row.quantity) > 0);
+      previewBox.hidden = false;
+    } catch (error) {
+      paperError.textContent = error.message;
+    } finally {
+      busySale = false;
+      if (!pendingSale) saleActions.querySelectorAll("button").forEach(button => button.disabled = false);
+    }
+  }
+
+  function closePreview() {
+    pendingSale = null;
+    previewBox.hidden = true;
+    saleActions.querySelectorAll("button").forEach(button => button.disabled = false);
+  }
+
+  cancelSale.addEventListener("click", closePreview);
+  confirmSale.addEventListener("click", async () => {
+    if (!pendingSale || busySale) return;
+    busySale = confirmSale.disabled = cancelSale.disabled = true;
+    try {
+      const result = await paperRequest("/sell", {
+        method: "POST", headers: writeHeaders, body: JSON.stringify(pendingSale),
+      });
+      paperError.textContent = `Продаж записано. Отримано ${display(result.net_uah)} грн.`;
+      closePreview();
+      await loadPaper();
+    } catch (error) {
+      paperError.textContent = error.status === 409
+        ? "Умови продажу змінилися. Відкрийте нову попередню оцінку."
+        : `Не вдалося підтвердити продаж. ${error.message}`;
+      if (error.status === 409) closePreview();
+    } finally {
+      busySale = cancelSale.disabled = false;
+      confirmSale.disabled = !pendingSale;
+      saleActions.querySelectorAll("button").forEach(button => button.disabled = !!pendingSale);
+    }
+  });
+  riskForm.addEventListener("input", () => { riskForm.dataset.dirty = "true"; });
+  riskForm.addEventListener("submit", async event => {
+    event.preventDefault();
+    const changes = Object.fromEntries(new FormData(riskForm));
+    changes.paused = riskForm.elements.paused.checked;
+    try {
+      await paperRequest("/risk", {method: "PUT", headers: writeHeaders, body: JSON.stringify(changes)});
+      delete riskForm.dataset.dirty;
+      paperError.textContent = "Налаштування збережено.";
+      await loadPaper();
+    } catch (error) {
+      paperError.textContent = error.message;
+    }
+  });
+
+  function showPaper(data) {
+    start.hidden = data.started;
+    start.disabled = starting || data.risk.paused;
+    if (!riskForm.dataset.dirty) {
+      riskForm.elements.paused.checked = data.risk.paused;
+      for (const key of ["daily_loss_percent", "drawdown_percent", "target_percent"]) {
+        riskForm.elements[key].value = data.risk[key];
+      }
+    }
+    riskForm.querySelector("button").disabled = false;
+    saleActions.replaceChildren();
+    for (const symbol of data.holdings.length ? [...data.holdings.map(row => row.symbol), "all"] : []) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = symbol === "all" ? "Продати весь портфель" : "Продати " + symbol;
+      button.disabled = busySale || !!pendingSale;
+      button.addEventListener("click", () => openPreview(symbol));
+      saleActions.append(button, " ");
+    }
+    const value = data.valuation;
+    paperStatus.textContent = data.warning
+      ? "Актуальна оцінка недоступна. Перевірте свіжість цін, курс і ліквідність."
+      : value ? [
+          data.risk.paused && "Покупки на паузі",
+          value.target_reached && `Ціль +${data.risk.target_percent}% досягнута`,
+          value.daily_loss_alert && "Перевищено поріг денного збитку",
+          value.drawdown_alert && "Перевищено поріг просадки",
+        ].filter(Boolean).join(" · ")
+      : data.risk.paused ? "Покупки на паузі" : "Прибуток: Ще не розраховується";
+    totals.replaceChildren();
+    const lines = [["Вільний баланс", `${display(data.cash_uah)} грн`]];
+    if (data.started) lines.push(["Реалізований прибуток / збиток", `${display(data.realized_pnl_uah)} грн`]);
+    if (value) {
+      lines.push(
+        ["Вартість активів за bid", `${display(value.assets_uah)} грн · ${display(value.assets_usdt, 4)} USDT`],
+        ["Портфель до витрат продажу", `${display(value.gross_uah)} грн · ${display(value.gross_usdt, 4)} USDT`],
+        ["Чиста оцінка після продажу", `${display(value.net_uah)} грн · ${display(value.net_usdt, 4)} USDT`],
+        ["Чистий прибуток / збиток", `${display(value.net_pnl_uah)} грн · ${display(value.net_pnl_usdt, 4)} USDT · ${display(value.net_pnl_percent)}%`],
+        ["Нереалізований прибуток / збиток", `${display(value.unrealized_pnl_uah)} грн`],
+        ["Максимальна зафіксована просадка", `${display(value.max_drawdown_percent)}%`],
+        ["Зміна за день (UTC)", `${display(value.daily_pnl_percent)}%`],
+      );
+      if (value.fx) lines.push(["Курс USDT → UAH (bid)",
+        `${value.fx.bid} грн за USDT · ${new Date(value.fx.received_at).toLocaleString("uk-UA")}`]);
+    }
+    for (const [label, amount] of lines) {
+      const term = document.createElement("dt");
+      const description = document.createElement("dd");
+      term.textContent = label;
+      description.textContent = amount;
+      totals.append(term, description);
+    }
+    document.querySelector("#paper-history").hidden = !data.started;
+    const operations = document.querySelector("#paper-operations");
+    operations.replaceChildren();
+    for (const op of data.operations) {
+      const item = document.createElement("li");
+      item.textContent = op.side === "sell"
+        ? `Продаж ${op.symbol}: ${op.quantity}, отримано ${op.net_uah} грн, залишок ${op.remaining_quantity}`
+        : `Купівля ${op.symbol}: ${op.quantity} після комісії ${op.fee_base} ${op.fee_asset}, списано ${op.debit_uah} грн`;
+      operations.append(item);
+    }
+    document.querySelector("#paper-audit").textContent = JSON.stringify(data, null, 2);
+  }
+
+  async function loadPaper() {
+    const generation = ++paperGeneration;
+    try {
+      const response = await fetch("/api/v1/paper", {cache: "no-store"});
+      if (!response.ok) throw new Error();
+      const data = await response.json();
+      if (generation === paperGeneration && !starting) showPaper(data);
+    } catch {
+      if (generation !== paperGeneration || starting) return;
+      paperStatus.textContent = "Віртуальний облік недоступний";
+      totals.replaceChildren();
+      document.querySelector("#paper-history").hidden = true;
+    }
+  }
+  start.addEventListener("click", async () => {
+    starting = start.disabled = true;
+    ++paperGeneration;
+    paperError.textContent = "";
+    paperStatus.textContent = "Перевірка курсу, котирувань та обмежень пар…";
+    try {
+      const response = await fetch("/api/v1/paper/start", {
+        method: "POST", headers: {"X-Crypto-Control": "paper-start"},
+      });
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.detail);
+      }
+      start.hidden = true;
+    } catch (error) {
+      paperError.textContent = `Покупки не виконано. ${error.message}`;
+    } finally {
+      starting = false;
+      await loadPaper();
+    }
+  });
+  async function pollPaper() {
+    if (!starting) await loadPaper();
+    setTimeout(pollPaper, 30000);
+  }
+  pollPaper();
+</script>
+</html>
