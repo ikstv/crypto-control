@@ -274,8 +274,9 @@ def migrate_ledger_schema(path):
             id INTEGER PRIMARY KEY, portfolio_id INTEGER NOT NULL REFERENCES portfolios(id), operation TEXT NOT NULL
         )""")
         raw.execute("""CREATE TABLE paper_sales (
+            sale_sequence INTEGER PRIMARY KEY,
             portfolio_id INTEGER NOT NULL REFERENCES portfolios(id), operation_id TEXT NOT NULL,
-            symbol TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY (portfolio_id, operation_id)
+            symbol TEXT NOT NULL, receipt TEXT NOT NULL, UNIQUE (portfolio_id, operation_id)
         )""")
         raw.execute("""CREATE TABLE paper_risk (
             portfolio_id INTEGER PRIMARY KEY REFERENCES portfolios(id), config TEXT NOT NULL
@@ -294,7 +295,7 @@ def migrate_ledger_schema(path):
         raw.execute("CREATE INDEX idx_positions_portfolio ON positions(portfolio_id)")
         raw.execute("CREATE INDEX idx_history_portfolio ON history(portfolio_id, id)")
         raw.execute("CREATE INDEX idx_operations_portfolio ON paper_operations(portfolio_id, id)")
-        raw.execute("CREATE INDEX idx_sales_portfolio ON paper_sales(portfolio_id, operation_id)")
+        raw.execute("CREATE INDEX idx_sales_portfolio ON paper_sales(portfolio_id, sale_sequence)")
         raw.execute("CREATE INDEX idx_equity_portfolio ON paper_equity(portfolio_id, id)")
         raw.execute("CREATE INDEX idx_observations_portfolio ON paper_observations(portfolio_id, slot)")
 
@@ -306,7 +307,10 @@ def migrate_ledger_schema(path):
         if "paper_operations" in renamed:
             raw.execute("INSERT INTO paper_operations SELECT id, 1, operation FROM __legacy_paper_operations")
         if "paper_sales" in renamed:
-            raw.execute("INSERT INTO paper_sales SELECT 1, operation_id, symbol, receipt FROM __legacy_paper_sales")
+            # The original ledger replays append order, even when IDs or times sort differently.
+            raw.execute("""INSERT INTO paper_sales (sale_sequence, portfolio_id, operation_id, symbol, receipt)
+                           SELECT rowid, 1, operation_id, symbol, receipt
+                           FROM __legacy_paper_sales ORDER BY rowid""")
         if "paper_risk" in renamed:
             raw.execute("INSERT INTO paper_risk SELECT 1, config FROM __legacy_paper_risk")
         if "paper_equity" in renamed:

@@ -9,13 +9,14 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from http.client import HTTPException
 
-from portfolio import SYMBOLS, read_portfolio
+from portfolio import SYMBOLS, connect, read_portfolio
 from quotes import fetch_public
 from balance_change import explain, snapshot
 
 FX = "USDT_UAH"
 MAX_AGE = 45
 CENT = Decimal("0.01")
+USDT_UNIT = Decimal("0.000001")
 ZERO = Decimal(0)
 DEFAULT_RISK = dict(paused=False, daily_loss_percent="3", drawdown_percent="5", target_percent="2")
 
@@ -47,6 +48,25 @@ def number(raw):
 
 def floor_step(value, step):
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def sale_proceeds(units, bid, fee_rate, fx):
+    gross = units * bid
+    fee = gross * fee_rate
+    net = gross - fee
+    if fx is None:
+        credit = net.quantize(USDT_UNIT, rounding=ROUND_DOWN)
+    else:
+        converted = net * number(fx["bid"])
+        credit = (converted - converted * number(fx["fee_rate"])).quantize(CENT, rounding=ROUND_DOWN)
+    return fee, net, credit
+
+
+def sold_basis(basis, units, available, quantum):
+    # A final fill releases the exact remainder, including any historical precision.
+    if units == available:
+        return basis
+    return (basis * units / available).quantize(quantum, rounding=ROUND_DOWN)
 
 
 def buy_levels(levels, budget, step, price_step):
@@ -98,13 +118,15 @@ class Ledger:
 
     def _read_only_history(self):
         plan = read_portfolio(self.path, self.portfolio_id)
-        with closing(sqlite3.connect(self.path)) as db:
+        with closing(connect(self.path)) as db:
+            db.execute("BEGIN")
             start = db.execute("SELECT snapshot FROM paper_start WHERE portfolio_id = ?", (self.portfolio_id,)).fetchone()
             operations = [json.loads(row[0]) for row in db.execute(
                 "SELECT operation FROM paper_operations WHERE portfolio_id = ? ORDER BY id", (self.portfolio_id,)
             )]
-            receipts = [json.loads(row[0]) for row in db.execute(
-                "SELECT receipt FROM paper_sales WHERE portfolio_id = ? ORDER BY operation_id", (self.portfolio_id,)
+            # rowid is the append sequence (also on older migrated copies).
+            receipts = [(key, json.loads(data)) for key, data in db.execute(
+                "SELECT operation_id, receipt FROM paper_sales WHERE portfolio_id = ? ORDER BY rowid", (self.portfolio_id,)
             )]
             risk_row = db.execute("SELECT config FROM paper_risk WHERE portfolio_id = ?", (self.portfolio_id,)).fetchone()
         risk = json.loads(risk_row[0]) if risk_row else DEFAULT_RISK.copy()
@@ -118,17 +140,32 @@ class Ledger:
         debit_key = "debit_uah" if plan["currency"] == "UAH" else "debit_usdt"
         cash_key = "cash_uah" if plan["currency"] == "UAH" else "cash_usdt"
         holdings = {op["symbol"]: dict(op, **{basis_key: op.get(debit_key, "0")}) for op in operations}
+        cash = number(snapshot[cash_key])
         realized = ZERO
-        for receipt in receipts:
-            for sale in receipt.get("sales", []):
-                if sale["symbol"] not in holdings:
-                    continue
-                holding = holdings[sale["symbol"]]
+        for operation_id, receipt in receipts:
+            for sale in receipt["sales"]:
+                # Migration copies receipts verbatim. Legacy UAH receipts carry
+                # the booked cost and proceeds in currency-suffixed fields.
+                if "remaining_basis" in sale:
+                    remaining = sale["remaining_basis"]
+                    cost, credit, pnl = sale["cost_basis"], sale["net_currency"], sale["realized_pnl"]
+                elif plan["currency"] == "UAH" and "remaining_basis_uah" in sale:
+                    remaining = sale["remaining_basis_uah"]
+                    cost, credit, pnl = sale["cost_basis_uah"], sale["net_uah"], sale["realized_pnl_uah"]
+                else:
+                    raise OperationConflict(f"Unrecognized receipt for sale {operation_id}")
+                holding = holdings.get(sale["symbol"])
+                if (holding is None
+                        or number(holding["quantity"]) != number(sale["quantity"]) + number(sale["remaining_quantity"])
+                        or number(holding[basis_key]) != number(cost) + number(remaining)
+                        or number(credit) - number(cost) != Decimal(pnl)):
+                    raise OperationConflict(f"Stored sale {operation_id} does not reconcile with the journal")
                 holding["quantity"] = sale["remaining_quantity"]
-                holding[basis_key] = sale.get("remaining_basis", holding.get(basis_key, "0"))
-                realized += Decimal(sale.get("realized_pnl", sale.get("realized_pnl_uah", "0")))
-                if cash_key in snapshot:
-                    snapshot[cash_key] = str(Decimal(snapshot[cash_key]) + Decimal(sale.get("net_currency", sale.get("net_uah", "0"))))
+                holding[basis_key] = remaining
+                cash += number(credit)
+                realized += Decimal(pnl)
+                operations.append(dict(sale, operation_id=operation_id))
+        snapshot[cash_key] = str(cash)
         extra.update(realized_pnl_uah=str(realized) if plan["currency"] == "UAH" else "0",
                      realized_pnl_usdt=str(realized) if plan["currency"] == "USDT" else "0",
                      holdings=[op for op in holdings.values() if number(op.get("quantity", "0")) > 0])
@@ -648,13 +685,13 @@ class Ledger:
             raise MarketUnavailable("No virtual position to sell")
         plan = read_portfolio(self.path, self.portfolio_id)
         markets = self.markets()
-        fx = fx_fee = None
+        fx = None
         if plan["currency"] == "UAH":
             fx_market = markets.get(FX)
             if fx_market is None:
                 raise MarketUnavailable("USDT/UAH spot market unavailable")
             fx = self.book(FX)
-            fx_fee = self.fee(fx_market)
+            fx["fee_rate"] = self.fee(fx_market)
         sales = []
         for holding in holdings:
             market = markets[holding["pair"]]
@@ -665,22 +702,20 @@ class Ledger:
             quantity = floor_step(min(available, book["bid_size"]), step)
             total = quantity * book["bid"]
             if quantity < number(market["minAmount"]) or total < number(market["minTotal"]):
-                quantity = total = ZERO
-            fee_amount = total * fee
-            net = total - fee_amount
+                quantity = ZERO
+            fee_amount, net, net_currency = sale_proceeds(quantity, book["bid"], fee, fx)
             if plan["currency"] == "UAH":
-                net_currency = (net * fx["bid"] * (1 - fx_fee)).quantize(CENT, rounding=ROUND_DOWN)
                 cost = number(holding.get("basis_uah", "0"))
             else:
-                net_currency = net.quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
                 cost = number(holding.get("basis_usdt", holding.get("debit_usdt", "0")))
+            cost_for_fill = sold_basis(cost, quantity, available, CENT if fx else USDT_UNIT)
             sales.append(dict(symbol=holding["symbol"], pair=holding["pair"], side="sell",
                               available_quantity=available, quantity=quantity,
                               remaining_quantity=available - quantity, bid=book["bid"],
                               ask=book["ask"], spread=book["ask"] - book["bid"],
                               fee_rate=fee, fee_usdt=fee_amount, net_usdt=net,
                               net_currency=net_currency, cost_basis=cost,
-                              realized_pnl=net_currency - cost * quantity / available if available else ZERO,
+                              realized_pnl=net_currency - cost_for_fill,
                               quote_timestamp=book["timestamp"], received_at=book["received_at"],
                               source=book["source"], warning=None if quantity == available else "Partial fill"))
         terms = [[sale["symbol"], sale["quantity"], sale["net_currency"]] for sale in sales]
@@ -771,37 +806,54 @@ class Ledger:
         return receipt
 
     def _sell_migrated(self, symbol, operation_id, fingerprint, quantity=None):
-        with closing(sqlite3.connect(self.path)) as existing_db:
-            existing = existing_db.execute("SELECT receipt FROM paper_sales WHERE portfolio_id=? AND operation_id=?",
-                                           (self.portfolio_id, operation_id)).fetchone()
-        if existing:
-            return json.loads(existing[0])
-        preview = self.preview(symbol)
-        if preview["fingerprint"] != fingerprint:
-            raise OperationConflict("Sale terms changed. Request a new preview.")
-        with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            existing = db.execute("SELECT receipt FROM paper_sales WHERE portfolio_id=? AND operation_id=?",
-                                 (self.portfolio_id, operation_id)).fetchone()
+        quantity = None if quantity is None else number(quantity)
+        with closing(connect(self.path)) as db, db:
+            def prior_receipt():
+                return self.sale_receipt(db, operation_id, symbol, self.portfolio_id, quantity)
+
+            existing = prior_receipt()
             if existing:
-                return json.loads(existing[0])
+                return existing
+            try:
+                preview = self.preview(symbol)
+            except MarketUnavailable:
+                # A concurrent retry may already have closed the last position.
+                existing = prior_receipt()
+                if existing:
+                    return existing
+                raise
+
+            db.execute("BEGIN IMMEDIATE")
+            existing = prior_receipt()
+            if existing:
+                return existing
+            revision = db.execute("SELECT COUNT(*) FROM paper_sales WHERE portfolio_id=?",
+                                  (self.portfolio_id,)).fetchone()[0]
+            if revision != preview["revision"] or fingerprint != preview["fingerprint"]:
+                raise OperationConflict("Sale terms changed. Request a new preview.")
+            fx = preview["fx"]
+            if fx and not fresh(fx["timestamp"]):
+                raise MarketUnavailable("Sale quotes expired before saving")
+            stamp = now().isoformat()
             sales = []
             for sale in preview["sales"]:
                 available_sale = number(sale["quantity"])
-                units = available_sale if quantity is None else min(available_sale, number(quantity))
+                units = available_sale if quantity is None else min(available_sale, quantity)
                 if units <= 0:
                     continue
-                ratio = units / available_sale
+                if not fresh(sale["quote_timestamp"]):
+                    raise MarketUnavailable("Sale quotes expired before saving")
                 available_total = number(sale["available_quantity"])
-                item = dict(sale, quantity=units, remaining_quantity=available_total - units,
-                            net_currency=(number(sale["net_currency"]) * ratio).quantize(Decimal("0.000001"), rounding=ROUND_DOWN),
-                            cost_basis=(number(sale["cost_basis"]) * units / available_total).quantize(Decimal("0.000001"), rounding=ROUND_DOWN))
-                item["realized_pnl"] = item["net_currency"] - item["cost_basis"]
-                item["remaining_basis"] = number(sale["cost_basis"]) - item["cost_basis"]
-                sales.append(item)
+                basis = number(sale["cost_basis"])
+                cost = sold_basis(basis, units, available_total, CENT if fx else USDT_UNIT)
+                fee, net, credit = sale_proceeds(units, number(sale["bid"]), number(sale["fee_rate"]), fx)
+                sales.append(dict(sale, time=stamp, operation_id=operation_id, quantity=units,
+                                  remaining_quantity=available_total - units, fee_usdt=fee, net_usdt=net,
+                                  net_currency=credit, cost_basis=cost, remaining_basis=basis - cost,
+                                  realized_pnl=credit - cost))
             if not sales:
                 raise MarketUnavailable("No quantity can be sold")
-            receipt = dict(operation_id=operation_id, portfolio_id=self.portfolio_id,
+            receipt = dict(operation_id=operation_id, requested_quantity=quantity, portfolio_id=self.portfolio_id,
                            currency=preview["currency"], sales=sales,
                            realized_pnl=sum((sale["realized_pnl"] for sale in sales), ZERO),
                            net_currency=sum((sale["net_currency"] for sale in sales), ZERO))
@@ -810,10 +862,21 @@ class Ledger:
         return decode(receipt)
 
     @staticmethod
-    def sale_receipt(db, operation_id, symbol):
-        row = db.execute("SELECT symbol, receipt FROM paper_sales WHERE operation_id = ?", (operation_id,)).fetchone()
-        if row:
-            if row[0] != symbol:
-                raise OperationConflict("Operation identifier already used for another sale")
-            return json.loads(row[1])
-        return None
+    def sale_receipt(db, operation_id, symbol, portfolio_id=None, quantity=None):
+        if portfolio_id is None:
+            row = db.execute("SELECT symbol, receipt FROM paper_sales WHERE operation_id=?", (operation_id,)).fetchone()
+        else:
+            row = db.execute("SELECT symbol, receipt FROM paper_sales WHERE portfolio_id=? AND operation_id=?",
+                             (portfolio_id, operation_id)).fetchone()
+        if row is None:
+            return None
+        if row[0] != symbol:
+            raise OperationConflict("Operation identifier already used for another sale")
+        receipt = json.loads(row[1])
+        # Older receipts did not retain the requested quantity. Replay the
+        # original result for their symbol without booking another fill.
+        if "requested_quantity" in receipt:
+            requested = receipt["requested_quantity"]
+            if quantity != (None if requested is None else number(requested)):
+                raise OperationConflict("Operation identifier already used with another quantity")
+        return receipt
