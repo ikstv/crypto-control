@@ -12,6 +12,7 @@ from http.client import HTTPException
 from portfolio import SYMBOLS, connect, read_portfolio
 from quotes import fetch_public
 from balance_change import explain, snapshot
+from equity import equity_history
 
 FX = "USDT_UAH"
 MAX_AGE = 45
@@ -37,6 +38,10 @@ class LedgerSchemaMismatch(Exception):
 
 def now():
     return datetime.now(timezone.utc)
+
+
+def observation_slot(stamp):
+    return stamp.replace(minute=stamp.minute // 5 * 5, second=0, microsecond=0).isoformat()
 
 
 def number(raw):
@@ -116,26 +121,27 @@ class Ledger:
                 "Write operations require the portfolio-aware Ledger adapter; migrated schema is read-only here"
             )
 
-    def _read_only_history(self):
+    def _read_only_history(self, db):
         plan = read_portfolio(self.path, self.portfolio_id)
-        with closing(connect(self.path)) as db:
-            db.execute("BEGIN")
-            start = db.execute("SELECT snapshot FROM paper_start WHERE portfolio_id = ?", (self.portfolio_id,)).fetchone()
-            operations = [json.loads(row[0]) for row in db.execute(
-                "SELECT operation FROM paper_operations WHERE portfolio_id = ? ORDER BY id", (self.portfolio_id,)
-            )]
-            # rowid is the append sequence (also on older migrated copies).
-            receipts = [(key, json.loads(data)) for key, data in db.execute(
-                "SELECT operation_id, receipt FROM paper_sales WHERE portfolio_id = ? ORDER BY rowid", (self.portfolio_id,)
-            )]
-            risk_row = db.execute("SELECT config FROM paper_risk WHERE portfolio_id = ?", (self.portfolio_id,)).fetchone()
+        start = db.execute("SELECT snapshot FROM paper_start WHERE portfolio_id = ?", (self.portfolio_id,)).fetchone()
+        operations = [json.loads(row[0]) for row in db.execute(
+            "SELECT operation FROM paper_operations WHERE portfolio_id = ? ORDER BY id", (self.portfolio_id,)
+        )]
+        # rowid is the append sequence (also on older migrated copies).
+        receipts = [(key, json.loads(data)) for key, data in db.execute(
+            "SELECT operation_id, receipt FROM paper_sales WHERE portfolio_id = ? ORDER BY rowid", (self.portfolio_id,)
+        )]
+        risk_row = db.execute("SELECT config FROM paper_risk WHERE portfolio_id = ?", (self.portfolio_id,)).fetchone()
         risk = json.loads(risk_row[0]) if risk_row else DEFAULT_RISK.copy()
-        extra = dict(risk=risk, revision=len(receipts), realized_pnl_uah="0", holdings=[],
-                     operations=operations, observations=self.observation_history())
+        currency = plan["currency"]
+        extra = dict(risk=risk, revision=len(receipts), holdings=[], operations=operations,
+                     realized_pnl_uah="0" if currency == "UAH" else None,
+                     realized_pnl_usdt="0" if currency == "USDT" else None)
         if start is None:
             cash_key = "cash_usdt" if plan["currency"] == "USDT" else "cash_uah"
             return dict(started=False, currency=plan["currency"], **{cash_key: str(Decimal(plan["initial_capital_minor"]) / (Decimal(10) ** plan["scale"]))}, **extra)
         snapshot = json.loads(start[0])
+        snapshot["currency"] = currency
         basis_key = "basis_uah" if plan["currency"] == "UAH" else "basis_usdt"
         debit_key = "debit_uah" if plan["currency"] == "UAH" else "debit_usdt"
         cash_key = "cash_uah" if plan["currency"] == "UAH" else "cash_usdt"
@@ -166,9 +172,8 @@ class Ledger:
                 realized += Decimal(pnl)
                 operations.append(dict(sale, operation_id=operation_id))
         snapshot[cash_key] = str(cash)
-        extra.update(realized_pnl_uah=str(realized) if plan["currency"] == "UAH" else "0",
-                     realized_pnl_usdt=str(realized) if plan["currency"] == "USDT" else "0",
-                     holdings=[op for op in holdings.values() if number(op.get("quantity", "0")) > 0])
+        extra[f"realized_pnl_{currency.lower()}"] = str(realized)
+        extra["holdings"] = [op for op in holdings.values() if number(op.get("quantity", "0")) > 0]
         return dict(started=True, **snapshot, **extra)
 
     def initialize(self):
@@ -226,23 +231,28 @@ class Ledger:
         return config
 
     def history(self):
-        if self._migrated():
-            return self._read_only_history()
-        self.initialize()
-        capital = Decimal(read_portfolio(self.path)["initial_capital_minor"]) / 100
-        with closing(sqlite3.connect(self.path)) as db, db:
+        return self._journal(include_observations=True)
+
+    def _journal(self, *, include_observations=False):
+        migrated = self._migrated()
+        if not migrated:
+            self.initialize()
+        with closing(connect(self.path)) as db:
             db.execute("BEGIN")
-            start = db.execute("SELECT snapshot FROM paper_start WHERE id = 1").fetchone()
-            operations = [json.loads(row[0]) for row in db.execute(
-                "SELECT operation FROM paper_operations ORDER BY id"
-            )]
-            receipts = [json.loads(row[0]) for row in db.execute(
-                "SELECT receipt FROM paper_sales ORDER BY rowid"
-            )]
-            risk = self.config(db)
+            journal = self._read_only_history(db) if migrated else self._legacy_journal(db)
+            if include_observations:
+                _, rows = equity_history(db, self.portfolio_id if migrated else None, journal, include_rows=True)
+                journal["observations"] = decode(rows)
+        return journal
+
+    def _legacy_journal(self, db):
+        capital = Decimal(read_portfolio(self.path)["initial_capital_minor"]) / 100
+        start = db.execute("SELECT snapshot FROM paper_start WHERE id = 1").fetchone()
+        operations = [json.loads(row[0]) for row in db.execute("SELECT operation FROM paper_operations ORDER BY id")]
+        receipts = [json.loads(row[0]) for row in db.execute("SELECT receipt FROM paper_sales ORDER BY rowid")]
+        risk = self.config(db)
         extra = dict(risk=risk, revision=len(receipts), realized_pnl_uah="0",
-                     holdings=[], operations=operations,
-                     observations=self.observation_history())
+                     holdings=[], operations=operations)
         if start is None:
             return dict(started=False, cash_uah=str(capital), **extra)
         snapshot = json.loads(start[0])
@@ -288,7 +298,9 @@ class Ledger:
             bids = sorted((tuple(map(number, level)) for level in book["bids"]), reverse=True)
             ask, ask_size = asks[0]
             bid, bid_size = bids[0]
-            if (book["ticker_id"] != pair or not fresh(stamp)
+            if not fresh(stamp):
+                raise MarketUnavailable(f"{pair}: stale order book")
+            if (book["ticker_id"] != pair
                     or not (bid <= ask) or any(price <= 0 or size <= 0 for price, size in asks + bids)):
                 raise ValueError("Invalid or stale book")
             return dict(ask=ask, ask_size=ask_size, bid=bid, bid_size=bid_size,
@@ -297,7 +309,7 @@ class Ledger:
                         source=f"https://whitebit.com/api/v4/public/{endpoint}")
         except (OSError, HTTPException, ValueError, InvalidOperation, TypeError,
                 KeyError, IndexError, OverflowError) as error:
-            raise MarketUnavailable(f"{pair}: order book unavailable or stale") from error
+            raise MarketUnavailable(f"{pair}: order book unavailable") from error
 
     def start(self):
         if self._migrated():
@@ -467,120 +479,66 @@ class Ledger:
         try:
             with self._balance_lock:
                 valuation = self.value(journal)
-                valuation.update(self.record_equity(journal, valuation["net_uah"], persist=False))
-                current = snapshot(journal, valuation, now().isoformat())
-                previous = self._previous_balance
-                valuation["balance_change"] = explain(previous, current) if previous else None
-                self._previous_balance = current
+                valuation.update(self.record_equity(journal, valuation["equity"], persist=False, valuation=valuation))
+                if valuation["currency"] == "UAH":
+                    current = snapshot(journal, valuation, now().isoformat())
+                    previous = self._previous_balance
+                    valuation["balance_change"] = explain(previous, current) if previous else None
+                    self._previous_balance = current
         except (MarketUnavailable, OperationConflict, InvalidOperation, ValueError, KeyError) as error:
             return dict(journal, valuation=None, warning=str(error))
         return dict(journal, valuation=decode(valuation), warning=None)
 
     def observation_history(self):
-        if self._migrated():
-            with closing(sqlite3.connect(self.path)) as db:
-                rows = db.execute("""SELECT slot, observed_at, status, reason, equity_uah,
-                    max_drawdown_percent, daily_pnl_percent FROM paper_observations
-                    WHERE portfolio_id = ? ORDER BY slot""", (self.portfolio_id,)).fetchall()
-            keys = ("slot", "observed_at", "status", "reason", "equity_uah",
-                    "max_drawdown_percent", "daily_pnl_percent")
-            return [dict(zip(keys, row)) for row in rows]
-        self.initialize()
-        with closing(sqlite3.connect(self.path)) as db:
-            rows = db.execute("""SELECT slot, observed_at, status, reason, equity_uah,
-                max_drawdown_percent, daily_pnl_percent
-                FROM paper_observations ORDER BY slot""").fetchall()
-        keys = ("slot", "observed_at", "status", "reason", "equity_uah",
-                "max_drawdown_percent", "daily_pnl_percent")
-        return [dict(zip(keys, row)) for row in rows]
+        return self.history()["observations"]
 
     def record_skip(self, reason, slot=None, status="unavailable"):
-        if self._migrated():
-            stamp = now()
-            slot = slot or stamp.replace(second=0, microsecond=0).isoformat()
-            with closing(sqlite3.connect(self.path)) as db, db:
-                inserted = db.execute("""INSERT OR IGNORE INTO paper_observations
-                    (portfolio_id, slot, observed_at, status, reason) VALUES (?, ?, ?, ?, ?)""",
-                    (self.portfolio_id, slot, stamp.isoformat(), status, reason)).rowcount
-            return {"status": status if inserted else "duplicate", "reason": reason}
-        self._ensure_legacy_writable()
         stamp = now()
-        slot = slot or stamp.replace(second=0, microsecond=0).isoformat()
-        with closing(sqlite3.connect(self.path)) as db, db:
-            inserted = db.execute("""INSERT OR IGNORE INTO paper_observations
-                (slot, observed_at, status, reason) VALUES (?, ?, ?, ?)""",
-                (slot, stamp.isoformat(), status, reason)).rowcount
+        slot = slot or observation_slot(stamp)
+        migrated = self._migrated()
+        columns = "portfolio_id, " if migrated else ""
+        prefix = "?, " if migrated else ""
+        args = (self.portfolio_id,) if migrated else ()
+        with closing(connect(self.path)) as db, db:
+            inserted = db.execute(f"""INSERT OR IGNORE INTO paper_observations
+                ({columns}slot, observed_at, status, reason) VALUES ({prefix}?, ?, ?, ?)""",
+                (*args, slot, stamp.isoformat(), status, reason)).rowcount
         return {"status": status if inserted else "duplicate", "reason": reason}
 
     def record_valuation(self, slot=None):
-        if self._migrated():
-            return self._record_valuation_migrated(slot)
-        self._ensure_legacy_writable()
-        journal = self.history()
-        if not journal["started"]:
-            return self.record_skip("Virtual trading has not started", slot)
-        stamp = now()
-        slot = slot or stamp.replace(second=0, microsecond=0).isoformat()
-        try:
-            with self._balance_lock:
-                valuation = self.value(journal)
-                stats = self.record_equity(journal, valuation["net_uah"], persist=False)
-            with closing(sqlite3.connect(self.path)) as db, db:
-                inserted = db.execute("""INSERT OR IGNORE INTO paper_observations
-                    (slot, observed_at, status, equity_uah,
-                     max_drawdown_percent, daily_pnl_percent)
-                    VALUES (?, ?, 'recorded', ?, ?, ?)""",
-                    (slot, stamp.isoformat(), str(valuation["net_uah"]),
-                     str(stats["max_drawdown_percent"]), str(stats["daily_pnl_percent"]))).rowcount
-            return {"status": "recorded" if inserted else "duplicate",
-                    "equity_uah": str(valuation["net_uah"])}
-        except (MarketUnavailable, OperationConflict, InvalidOperation, ValueError, KeyError) as error:
-            reason = str(error)
-            status = "stale" if "stale" in reason.lower() or "expired" in reason.lower() else "unavailable"
-            return self.record_skip(reason, slot, status)
-
-    def _record_valuation_migrated(self, slot=None):
-        journal = self.history()
-        stamp = now()
-        slot = slot or stamp.replace(second=0, microsecond=0).isoformat()
+        slot = slot or observation_slot(now())
+        journal = self._journal()
         if not journal["started"]:
             return self.record_skip("Virtual trading has not started", slot)
         try:
-            plan = read_portfolio(self.path, self.portfolio_id)
-            preview = self.preview("all")
-            cash_key = "cash_uah" if plan["currency"] == "UAH" else "cash_usdt"
-            cash = number(journal.get(cash_key, "0"))
-            proceeds = sum((number(sale["net_currency"]) for sale in preview["sales"]), ZERO)
-            equity = cash + proceeds
-            initial = Decimal(plan["initial_capital_minor"]) / (Decimal(10) ** plan["scale"])
-            with closing(sqlite3.connect(self.path)) as db, db:
-                prior = [number(row[0]) for row in db.execute(
-                    "SELECT equity_uah FROM paper_equity WHERE portfolio_id=? ORDER BY id", (self.portfolio_id,))]
-                peak = max([initial, *prior, equity])
-                drawdown = (peak - equity) / peak * 100 if peak else ZERO
-                inserted = db.execute("""INSERT OR IGNORE INTO paper_observations
-                    (portfolio_id, slot, observed_at, status, equity_uah,
-                     max_drawdown_percent, daily_pnl_percent)
-                    VALUES (?, ?, ?, 'recorded', ?, ?, ?)""",
-                    (self.portfolio_id, slot, stamp.isoformat(), str(equity), str(drawdown), "0")).rowcount
-                if inserted:
-                    db.execute("""INSERT INTO paper_equity
-                        (portfolio_id, observed_at, day, equity_uah, equity_currency)
-                        VALUES (?, ?, ?, ?, ?)""",
-                        (self.portfolio_id, stamp.isoformat(), stamp.date().isoformat(), str(equity), plan["currency"]))
-            return {"status": "recorded" if inserted else "duplicate",
-                    "equity": str(equity), "currency": plan["currency"],
-                    "max_drawdown_percent": str(drawdown)}
+            valuation = self.value(journal)
+            result = self.record_equity(journal, valuation["equity"], slot=slot, valuation=valuation)
+            return decode(result)
         except (MarketUnavailable, OperationConflict, InvalidOperation, ValueError, KeyError) as error:
             reason = str(error)
             status = "stale" if "stale" in reason.lower() or "expired" in reason.lower() else "unavailable"
             return self.record_skip(reason, slot, status)
 
     def value(self, journal):
+        if journal.get("currency") == "USDT":
+            cash = number(journal["cash_usdt"])
+            sales = self._preview_migrated("all", journal)["sales"] if journal["holdings"] else []
+            assets = sum((number(p["available_quantity"]) * number(p["bid"]) for p in sales), ZERO)
+            equity = cash + sum((number(p["net_currency"]) for p in sales), ZERO)
+            initial = number(journal["initial_usdt"])
+            pnl = equity - initial
+            realized = Decimal(journal["realized_pnl_usdt"])
+            return dict(currency="USDT", cash_usdt=cash, assets_usdt=assets, gross_usdt=cash + assets,
+                        equity=equity, net_usdt=equity, net_pnl_usdt=pnl, realized_pnl_usdt=realized,
+                        unrealized_pnl_usdt=pnl - realized, net_pnl_percent=pnl / initial * 100,
+                        target_reached=pnl >= initial * number(journal["risk"]["target_percent"]) / 100,
+                        fx=None, positions=sales)
         if not journal["holdings"]:
             cash = number(journal["cash_uah"])
             return self.totals(journal, cash, ZERO, ZERO, None, ZERO, [])
         markets = self.markets()
+        if FX not in markets:
+            raise MarketUnavailable("USDT/UAH spot market unavailable")
         fx_fee = self.fee(markets[FX])
         fx = self.book(FX)
         details = []
@@ -606,10 +564,12 @@ class Ledger:
         pnl = net_uah - initial
         realized = Decimal(journal["realized_pnl_uah"])
         return dict(
+            currency="UAH", equity=net_uah,
             assets_uah=gross * rate, assets_usdt=gross, cash_usdt=cash_usdt,
             gross_uah=gross_uah, gross_usdt=cash_usdt + gross if fx else None,
             net_uah=net_uah, net_usdt=cash_usdt + net if fx else None,
-            net_pnl_uah=pnl, net_pnl_usdt=cash_usdt + net - number(journal["initial_usdt"]) if fx else None,
+            net_pnl_uah=pnl, net_pnl_usdt=(cash_usdt + net - number(journal["initial_usdt"])
+                                           if fx and journal.get("initial_usdt") is not None else None),
             realized_pnl_uah=realized, unrealized_pnl_uah=pnl - realized,
             net_pnl_percent=pnl / initial * 100,
             target_reached=pnl >= initial * number(journal["risk"]["target_percent"]) / 100,
@@ -617,33 +577,54 @@ class Ledger:
             positions=details,
         )
 
-    def record_equity(self, journal, equity, persist=True):
-        stamp = now()
-        # The daily boundary is explicitly UTC on every Windows installation.
-        day = stamp.date().isoformat()
-        with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            revision = db.execute("SELECT COUNT(*) FROM paper_sales").fetchone()[0]
+    def record_equity(self, journal, equity, persist=True, *, slot=None, valuation=None):
+        migrated = self._migrated()
+        scope = " WHERE portfolio_id=?" if migrated else ""
+        args = (self.portfolio_id,) if migrated else ()
+        columns, prefix = ("portfolio_id, ", "?, ") if migrated else ("", "")
+        currency = journal.get("currency", "UAH")
+        with closing(connect(self.path)) as db, db:
+            db.execute("BEGIN IMMEDIATE" if persist else "BEGIN")
+            if slot is not None:
+                prior = db.execute("SELECT 1 FROM paper_observations WHERE slot=?" +
+                                   (" AND portfolio_id=?" if migrated else ""), (slot, *args)).fetchone()
+                if prior:
+                    return {"status": "duplicate"}
+            revision = db.execute("SELECT COUNT(*) FROM paper_sales" + scope, args).fetchone()[0]
             if revision != journal["revision"]:
                 raise OperationConflict("Portfolio changed during valuation. Refresh the estimate.")
-            rows = db.execute("SELECT day, equity_uah FROM paper_equity ORDER BY id").fetchall()
+            if valuation is not None:
+                fx = valuation.get("fx")
+                if ((fx and not fresh(fx["timestamp"])) or
+                        any(not fresh(p["quote_timestamp"]) for p in valuation["positions"])):
+                    raise MarketUnavailable("Valuation quotes expired")
+            stamp = now()
+            curve, _ = equity_history(db, self.portfolio_id if migrated else None, journal, until=stamp)
+            prior_maximum = curve.maximum
+            stats = curve.mark(stamp, equity, recorded=persist)
+            if not persist:
+                stats["max_drawdown_percent"] = prior_maximum
             if persist:
-                db.execute("INSERT INTO paper_equity (observed_at, day, equity_uah) VALUES (?, ?, ?)",
-                           (stamp.isoformat(), day, str(equity)))
-        peak = number(journal["initial_uah"])
-        maximum = ZERO
-        prior = []
-        if self._previous_balance is not None:
-            prior.append((day, str(self._previous_balance["net"])))
-        daily_open = next((number(value) for date, value in rows + prior if date == day), equity)
-        for _, value in rows + prior + [(day, str(equity))]:
-            peak = max(peak, number(value))
-            maximum = max(maximum, (peak - number(value)) / peak * 100)
-        daily_pnl = (equity - daily_open) / daily_open * 100 if daily_open else ZERO
+                if slot is not None:
+                    daily = stats["daily_pnl_percent"]
+                    db.execute(f"""INSERT INTO paper_observations
+                        ({columns}slot, observed_at, status, equity_uah, max_drawdown_percent, daily_pnl_percent)
+                        VALUES ({prefix}?, ?, 'recorded', ?, ?, ?)""",
+                        (*args, slot, stamp.isoformat(), str(equity), str(stats["max_drawdown_percent"]),
+                         str(daily) if daily is not None else None))
+                fields = ", equity_currency" if migrated else ""
+                values = ", ?" if migrated else ""
+                db.execute(f"""INSERT INTO paper_equity ({columns}observed_at, day, equity_uah{fields})
+                    VALUES ({prefix}?, ?, ?{values})""", (*args, stamp.isoformat(), stamp.date().isoformat(),
+                    str(equity), *((currency,) if migrated else ())))
         risk = journal["risk"]
-        return dict(max_drawdown_percent=maximum, daily_pnl_percent=daily_pnl,
-                    daily_loss_alert=daily_pnl <= -number(risk["daily_loss_percent"]),
-                    drawdown_alert=maximum >= number(risk["drawdown_percent"]))
+        daily = stats["daily_pnl_percent"]
+        stats.update(daily_loss_alert=daily is not None and daily <= -number(risk["daily_loss_percent"]),
+                     drawdown_alert=stats["max_drawdown_percent"] >= number(risk["drawdown_percent"]))
+        if slot is not None:
+            stats.update(status="recorded", currency=currency, equity=equity)
+            stats[f"equity_{currency.lower()}"] = equity
+        return stats
 
     def preview(self, symbol):
         if self._migrated():
@@ -678,15 +659,16 @@ class Ledger:
                            fx=dict(fx, pair=FX, direction="USDT_to_UAH", fee_rate=fx_fee),
                            fingerprint=fingerprint))
 
-    def _preview_migrated(self, symbol):
-        journal = self.history()
+    def _preview_migrated(self, symbol, journal=None):
+        if journal is None:
+            journal = self._journal()
         holdings = [op for op in journal["holdings"] if symbol in ("all", op["symbol"])]
         if not holdings:
             raise MarketUnavailable("No virtual position to sell")
-        plan = read_portfolio(self.path, self.portfolio_id)
+        currency = journal["currency"]
         markets = self.markets()
         fx = None
-        if plan["currency"] == "UAH":
+        if currency == "UAH":
             fx_market = markets.get(FX)
             if fx_market is None:
                 raise MarketUnavailable("USDT/UAH spot market unavailable")
@@ -704,7 +686,7 @@ class Ledger:
             if quantity < number(market["minAmount"]) or total < number(market["minTotal"]):
                 quantity = ZERO
             fee_amount, net, net_currency = sale_proceeds(quantity, book["bid"], fee, fx)
-            if plan["currency"] == "UAH":
+            if currency == "UAH":
                 cost = number(holding.get("basis_uah", "0"))
             else:
                 cost = number(holding.get("basis_usdt", holding.get("debit_usdt", "0")))
@@ -721,7 +703,7 @@ class Ledger:
         terms = [[sale["symbol"], sale["quantity"], sale["net_currency"]] for sale in sales]
         fingerprint = hashlib.sha256(exact_json([journal["revision"], symbol, terms]).encode()).hexdigest()
         return decode(dict(symbol=symbol, revision=journal["revision"], sales=sales,
-                           currency=plan["currency"], fx=fx, fingerprint=fingerprint))
+                           currency=currency, fx=fx, fingerprint=fingerprint))
 
     def sale_quote(self, holding, market, book, fx, fx_fee, fx_left):
         available = number(holding["quantity"])

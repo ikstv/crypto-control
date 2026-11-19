@@ -21,7 +21,7 @@ class EngineTests(unittest.TestCase):
             self.skipTest("subprocess loopback tests require a normal Windows network sandbox")
         self.temp = tempfile.TemporaryDirectory(prefix="crypto-engine-")
         self.root = Path(self.temp.name)
-        for name in ("engine.py", "app.py", "portfolio.py", "ledger.py", "quotes.py",
+        for name in ("engine.py", "app.py", "portfolio.py", "ledger.py", "equity.py", "quotes.py",
                      "balance_change.py", "algorithm.py", "backtest.py", "shadow.py", "index.html"):
             shutil.copy2(ROOT / name, self.root / name)
         (self.root / "data").mkdir()

@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from portfolio import (initialize, read_portfolio, ledger_schema_migrated,
                        existing_portfolio_ids, list_existing_portfolios,
                        create_portfolio, read_portfolio_for)
-from ledger import Ledger, MarketUnavailable, OperationConflict, LedgerSchemaMismatch
+from ledger import Ledger, MarketUnavailable, OperationConflict, LedgerSchemaMismatch, observation_slot
 from quotes import Quotes
 
 ROOT = Path(__file__).resolve().parent
@@ -63,7 +63,7 @@ async def history_loop(ledger, interval=300, sleep=asyncio.sleep, record=None):
 
 async def all_portfolio_history_loop(db_path, fetch, interval=300, sleep=asyncio.sleep):
     while True:
-        slot = datetime.now(timezone.utc).replace(second=0, microsecond=0).isoformat()
+        slot = observation_slot(datetime.now(timezone.utc))
         for portfolio_id in existing_portfolio_ids(db_path):
             await asyncio.to_thread(Ledger(db_path, fetch, portfolio_id=portfolio_id).record_valuation, slot)
         await sleep(interval)
@@ -194,9 +194,10 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3", start_workers=T
 
     @app.get("/api/v1/portfolios/{portfolio_id}")
     def portfolio_detail(portfolio_id: int) -> dict:
-        ledger = portfolio_ledger(portfolio_id)
-        return {**read_portfolio_for(db_path, portfolio_id), "history": ledger.history(),
-                "observations": ledger.observation_history()}
+        state = portfolio_ledger(portfolio_id).state()
+        valuation, warning = state.pop("valuation"), state.pop("warning")
+        return {**read_portfolio_for(db_path, portfolio_id), "history": state,
+                "observations": state["observations"], "valuation": valuation, "warning": warning}
 
     @app.post("/api/v1/portfolios/{portfolio_id}/paper/start")
     def portfolio_start(portfolio_id: int, x_crypto_control: str = Header()) -> dict:

@@ -50,7 +50,7 @@ class SaleTests(TestCase):
             return response
 
         self.ledger.start()
-        self.ledger.state()
+        self.ledger.record_valuation()
         self.ledger.fetch = finer_sell_step
         sale, = self.sale("all")["sales"]
         self.assertEqual(Decimal(sale["remaining_quantity"]), 0)
