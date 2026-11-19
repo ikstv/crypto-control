@@ -22,7 +22,7 @@ class EngineTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="crypto-engine-")
         self.root = Path(self.temp.name)
         for name in ("engine.py", "app.py", "portfolio.py", "ledger.py", "quotes.py",
-                     "balance_change.py", "index.html"):
+                     "balance_change.py", "algorithm.py", "index.html"):
             shutil.copy2(ROOT / name, self.root / name)
         (self.root / "data").mkdir()
         self.port = self.free_port()

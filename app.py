@@ -1,4 +1,5 @@
 import asyncio
+from algorithm import Algorithm, Blocked
 import os
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -48,6 +49,7 @@ def require_paper_header(value):
 def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3"):
     quotes = Quotes()
     ledger = Ledger(db_path, fee_override=os.getenv("CRYPTO_CONTROL_TAKER_FEE_PERCENT"))
+    algorithm = Algorithm(db_path)
 
     async def poll_quotes():
         while True:
@@ -71,6 +73,23 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3"):
                 await history_worker
 
     app = FastAPI(title="Crypto Control", version="1.0.0", lifespan=lifespan)
+
+    @app.get("/api/v1/algorithm")
+    def algorithm_status():
+        return {"mode": algorithm.status(), "strategy_available": False}
+
+    @app.get("/api/v1/algorithm/history")
+    def algorithm_history():
+        return {"changes": algorithm.history()}
+
+    @app.post("/api/v1/algorithm/{action}")
+    def algorithm_change(action: Literal["activate", "stop", "emergency", "reset"],
+                         x_crypto_control: str = Header(), confirmed: bool = False):
+        require_paper_header(x_crypto_control)
+        try:
+            return {"mode": algorithm.change(action, confirmed)}
+        except Blocked as error:
+            raise HTTPException(409, str(error)) from error
 
     @app.get("/", include_in_schema=False)
     def home():

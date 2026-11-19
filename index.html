@@ -73,7 +73,48 @@
       </table>
     </div>
   </section>
+  <section aria-labelledby="algorithm-heading">
+    <h2 id="algorithm-heading">Керування алгоритмом</h2>
+    <p id="algorithm-status" role="status"></p>
+    <button type="button" data-algorithm="activate">Активувати режим</button>
+    <button type="button" data-algorithm="stop">Зупинити алгоритм</button>
+    <button type="button" data-algorithm="emergency">Аварійна зупинка</button>
+    <button type="button" data-algorithm="reset">Зняти блокування</button>
+  </section>
 </main>
+<script>
+  (() => {
+    const url = "/api/v1/algorithm";
+    const status = document.querySelector("#algorithm-status");
+    const buttons = [...document.querySelectorAll("[data-algorithm]")];
+    const labels = { stopped: "Зупинено", active: "Активовано",
+                     blocked: "Аварійно заблоковано" };
+    async function update(action) {
+      buttons.forEach(button => { button.disabled = true; });
+      try {
+        const response = action
+          ? await fetch(url + "/" + action + (action === "reset" ? "?confirmed=true" : ""), {
+              method: "POST", headers: {"X-Crypto-Control": "paper-start"}
+            })
+          : await fetch(url, {cache: "no-store"});
+        if (!response.ok) throw new Error();
+        const {mode} = await response.json();
+        status.textContent = labels[mode] + ". Торгову стратегію ще не підключено.";
+      } catch {
+        status.textContent = "Не вдалося підтвердити режим. Перевірте підключення та повторіть дію.";
+      } finally {
+        buttons.forEach(button => { button.disabled = false; });
+      }
+    }
+    buttons.forEach(button => button.addEventListener("click", () => {
+      const action = button.dataset.algorithm;
+      if (action !== "reset" || window.confirm("Зняти аварійне блокування? Алгоритм залишиться зупиненим.")) {
+        update(action);
+      }
+    }));
+    update();
+  })();
+</script>
 <script>
   async function loadPortfolio() {
     const status = document.querySelector("#status");
