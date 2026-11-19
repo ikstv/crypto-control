@@ -150,8 +150,19 @@ def list_portfolios(path):
     return [dict(zip(keys, row)) for row in rows]
 
 
-def create_portfolio(path, name, currency, initial_capital, idempotency_key):
-    migrate_portfolios(path)
+def list_existing_portfolios(path):
+    with closing(connect(path)) as db:
+        if not ledger_schema_migrated(path):
+            return []
+        rows = db.execute("""SELECT id, name, currency, initial_capital_minor,
+            scale, created_at FROM portfolios ORDER BY id""").fetchall()
+    keys = ("id", "name", "currency", "initial_capital_minor", "scale", "created_at")
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def create_portfolio(path, name, currency, initial_capital, idempotency_key, migrate=True):
+    if migrate:
+        migrate_portfolios(path)
     if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100:
         raise ValueError("Portfolio name is required")
     if not isinstance(idempotency_key, str) or not idempotency_key.strip() or len(idempotency_key) > 200:
