@@ -17,7 +17,7 @@ from portfolio import (
     migrate_ledger_schema,
     read_portfolio,
 )
-from ledger import Ledger, LedgerSchemaMismatch
+from ledger import Ledger, LedgerSchemaMismatch, MarketUnavailable
 from test_ledger import feed
 
 
@@ -132,10 +132,10 @@ class PortfolioTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Ledger(self.path, portfolio_id=999).history()
 
-    def test_migrated_read_only_ledger_refuses_financial_writes(self):
+    def test_migrated_ledger_rejects_sale_without_position(self):
         migrate_ledger_schema(self.path)
         ledger = Ledger(self.path, portfolio_id=1)
-        with self.assertRaises(LedgerSchemaMismatch):
+        with self.assertRaises(MarketUnavailable):
             ledger.sell("BTC", "sale", "0" * 64)
 
     def _migrated_with_usdt(self):
@@ -171,6 +171,32 @@ class PortfolioTests(unittest.TestCase):
         no_fx = lambda endpoint: feed(endpoint, fx=False)
         result = Ledger(self.path, no_fx, portfolio_id=other_id).start()
         self.assertTrue(result["started"])
+
+    def test_migrated_usdt_partial_and_full_sales_isolated(self):
+        other_id = self._migrated_with_usdt()
+        ledger = Ledger(self.path, feed, portfolio_id=other_id)
+        ledger.start()
+        preview = ledger.preview("BTC")
+        self.assertGreater(Decimal(preview["sales"][0]["quantity"]), 0)
+        partial = Decimal(preview["sales"][0]["quantity"]) / 2
+        first = ledger.sell("BTC", "sale-1", preview["fingerprint"], quantity=partial)
+        again = ledger.sell("BTC", "sale-1", preview["fingerprint"], quantity=partial)
+        self.assertEqual(first, again)
+        self.assertGreater(Decimal(first["sales"][0]["remaining_quantity"]), 0)
+        second_preview = ledger.preview("BTC")
+        second = ledger.sell("BTC", "sale-2", second_preview["fingerprint"])
+        self.assertEqual(Decimal(second["sales"][0]["remaining_quantity"]), 0)
+        self.assertGreater(Decimal(ledger.history()["cash_usdt"]), Decimal("1"))
+        self.assertEqual(len(Ledger(self.path, portfolio_id=1).history()["operations"]), 0)
+
+    def test_migrated_uah_sale_uses_fx_and_realizes_pnl(self):
+        self._migrated_with_usdt()
+        ledger = Ledger(self.path, feed, portfolio_id=1)
+        ledger.start()
+        preview = ledger.preview("BTC")
+        receipt = ledger.sell("BTC", "uah-sale", preview["fingerprint"])
+        self.assertEqual(receipt["currency"], "UAH")
+        self.assertIn("realized_pnl", receipt)
 
 
 if __name__ == "__main__":
