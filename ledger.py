@@ -3,6 +3,7 @@
 import json
 import hashlib
 import sqlite3
+from threading import Lock
 from contextlib import closing
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
@@ -10,6 +11,7 @@ from http.client import HTTPException
 
 from portfolio import SYMBOLS, read_portfolio
 from quotes import fetch_public
+from balance_change import explain, snapshot
 
 FX = "USDT_UAH"
 MAX_AGE = 45
@@ -71,6 +73,8 @@ class Ledger:
     def __init__(self, path, fetch=fetch_public, fee_override=None):
         self.path = path
         self.fetch = fetch
+        self._balance_lock = Lock()
+        self._previous_balance = None
         self.fee_override = number(fee_override) if fee_override is not None else None
         if self.fee_override is not None and self.fee_override >= 100:
             raise ValueError("Taker fee percent must be less than 100")
@@ -277,8 +281,13 @@ class Ledger:
         if not journal["started"]:
             return dict(journal, valuation=None, warning=None)
         try:
-            valuation = self.value(journal)
-            valuation.update(self.record_equity(journal, valuation["net_uah"]))
+            with self._balance_lock:
+                valuation = self.value(journal)
+                valuation.update(self.record_equity(journal, valuation["net_uah"]))
+                current = snapshot(journal, valuation, now().isoformat())
+                previous = self._previous_balance
+                valuation["balance_change"] = explain(previous, current) if previous else None
+                self._previous_balance = current
         except (MarketUnavailable, OperationConflict, InvalidOperation, ValueError, KeyError) as error:
             return dict(journal, valuation=None, warning=str(error))
         return dict(journal, valuation=decode(valuation), warning=None)

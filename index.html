@@ -25,6 +25,11 @@
     <p id="paper-status" role="status"></p>
     <p id="paper-error" role="alert"></p>
     <dl id="paper-totals"></dl>
+    <section aria-labelledby="balance-change-heading">
+      <h3 id="balance-change-heading">Чому змінився мій баланс?</h3>
+      <p id="balance-change-status"></p>
+      <dl id="balance-effects"></dl>
+    </section>
     <div id="sale-actions"></div>
     <div id="sale-preview" hidden>
       <h3>Попередня оцінка продажу</h3>
@@ -230,6 +235,37 @@
     }
   });
 
+  function showBalanceChange(value, warning) {
+    const status = document.querySelector("#balance-change-status");
+    const list = document.querySelector("#balance-effects");
+    list.replaceChildren();
+    const change = value?.balance_change;
+    if (!change) {
+      status.textContent = warning ? "Свіжа оцінка недоступна."
+        : "Для порівняння потрібні дві успішні оцінки портфеля.";
+      return;
+    }
+    const signed = amount => `${Number(amount) > 0 ? "+" : ""}${display(amount)} грн`;
+    const time = value => new Date(value).toLocaleString("uk-UA");
+    status.textContent = `Чиста оцінка: ${signed(change.total_uah)} · ${time(change.from_time)} → ${time(change.to_time)}`;
+    if (change.operations_between) {
+      status.textContent += ". Між оцінками був продаж. Розклад з’явиться після наступної оцінки.";
+      return;
+    }
+    const labels = {
+      crypto: "Ціни монет у USDT", fx: "Курс USDT/UAH", spread: "Спред монет і USDT/UAH",
+      fees: "Оцінені комісії продажу й конвертації",
+      liquidity: "Глибина книги та обмеження продажу", rounding: "Округлення",
+    };
+    for (const [key, label] of Object.entries(labels)) {
+      const term = document.createElement("dt");
+      const amount = document.createElement("dd");
+      term.textContent = label;
+      amount.textContent = signed(change.effects[key]);
+      list.append(term, amount);
+    }
+  }
+
   function showPaper(data) {
     start.hidden = data.started;
     start.disabled = starting || data.risk.paused;
@@ -250,6 +286,7 @@
       saleActions.append(button, " ");
     }
     const value = data.valuation;
+    showBalanceChange(value, data.warning);
     paperStatus.textContent = data.warning
       ? "Актуальна оцінка недоступна. Перевірте свіжість цін, курс і ліквідність."
       : value ? [
@@ -305,6 +342,7 @@
     } catch {
       if (generation !== paperGeneration || starting) return;
       paperStatus.textContent = "Віртуальний облік недоступний";
+      showBalanceChange(null, true);
       totals.replaceChildren();
       document.querySelector("#paper-history").hidden = true;
     }
