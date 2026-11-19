@@ -23,13 +23,15 @@ def main():
         "slippage_stress": Costs(D("0.1"), D(10), D(25)),
         "combined_stress": Costs(D("0.2"), D(10), D(25)),
     }
-    for period, segment in (
-        ("development", [c for c in candles if c.timestamp < split]),
-        ("holdout", [c for c in candles if c.timestamp >= split]),
+    development = [c for c in candles if c.timestamp < split]
+    for period, segment, history in (
+        ("development", development, ()),
+        ("holdout", [c for c in candles if c.timestamp >= split], development[-30:]),
     ):
         for scenario, costs in scenarios.items():
             for strategy in ("ma", "hold", "cash"):
-                result = simulate(segment, D(1000), costs, strategy)
+                warmup = history if strategy == "ma" else ()
+                result = simulate(segment, D(1000), costs, strategy, warmup=warmup)
                 print(json.dumps(dict(period=period, days=len(segment), scenario=scenario,
                                       strategy=strategy, **result), default=str))
 

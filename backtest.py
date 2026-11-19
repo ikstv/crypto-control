@@ -125,26 +125,31 @@ def crossover(closes, fast=10, slow=30):
     return decision, short, long
 
 
-def simulate(candles, capital, costs, strategy, *, fast=10, slow=30, tp=D(2), sl=D(1)):
+def simulate(candles, capital, costs, strategy, *, fast=10, slow=30, tp=D(2), sl=D(1), warmup=()):
     if (not candles or not capital.is_finite() or capital <= 0 or not 0 < fast < slow
             or not tp.is_finite() or not sl.is_finite() or not 0 < sl < 100 or tp <= 0
             or strategy not in {"hold", "ma", "tp_sl", "cash"}):
         raise ValueError("Invalid simulation parameters")
     fee, impact = costs.rates()
+    if warmup and (len(warmup) < slow or any(
+            candle.timestamp != candles[0].timestamp - (len(warmup) - index) * DAY
+            for index, candle in enumerate(warmup))):
+        raise ValueError("Warmup must contain consecutive days immediately before the simulation")
     cash, units, entry, basis = capital, D(0), D(0), D(0)
     peak, drawdown = capital, D(0)
-    trades = wins = 0
+    trades = wins = losses = 0
     pending = "buy" if strategy in {"hold", "tp_sl"} else None
-    closes = []
+    closes = [candle.close for candle in warmup[-slow:]]
     execution_cost = D(0)
 
     def sell(price):
-        nonlocal cash, units, trades, wins, execution_cost
+        nonlocal cash, units, trades, wins, losses, execution_cost
         cash = units * price * (1 - impact) * (1 - fee)
         execution_cost += units * price - cash
         units = D(0)
         trades += 1
         wins += int(cash > basis)
+        losses += int(cash < basis)
 
     for index, candle in enumerate(candles):
         if pending == "buy":
@@ -178,7 +183,8 @@ def simulate(candles, capital, costs, strategy, *, fast=10, slow=30, tp=D(2), sl
                 pending = "sell"
     return dict(balance=cash, return_percent=(cash / capital - 1) * 100,
                 execution_cost_usdt=execution_cost,
-                drawdown_percent=drawdown, trades=trades,
+                drawdown_percent=drawdown, trades=trades, wins=wins, losses=losses,
+                realized_pnl_usdt=cash - capital, unrealized_pnl_usdt=D(0),
                 win_percent=D(wins) / trades * 100 if trades else None)
 
 
@@ -224,7 +230,8 @@ def main():
             quality=dict(candles=len(candles), missing=0, duplicates=0),
             tp_sl_training_candidates=candidates, selected_tp_sl=[best["tp"], best["sl"]],
             training=dict(candles=len(training), hold=run(training, "hold"), ma=run(training, "ma"), tp_sl=best),
-            holdout=dict(candles=len(holdout), hold=run(holdout, "hold"), ma=run(holdout, "ma"),
+            holdout=dict(candles=len(holdout), hold=run(holdout, "hold"),
+                         ma=run(holdout, "ma", warmup=training[-args.slow:]),
                          tp_sl=run(holdout, "tp_sl", tp=best["tp"], sl=best["sl"])),
         )
         print(json.dumps(report, indent=2, default=str))

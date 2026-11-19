@@ -2,9 +2,10 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 from algorithm import Algorithm
-from backtest import DAY
+from backtest import Costs, DAY, crossover, simulate, validate
 from shadow import Shadow
 
 
@@ -30,6 +31,21 @@ class ShadowTests(unittest.TestCase):
                 self.assertEqual(row["decision"], expected)
                 self.assertEqual(Decimal(row["sma10"]), Decimal(sum(prices[index-10:index])) / 10)
                 self.assertEqual(Decimal(row["sma30"]), Decimal(sum(prices[index-30:index])) / 30)
+            series = validate(rows, start, start + len(rows) * DAY)
+            decisions = []
+
+            def record_signal(closes, fast, slow):
+                result = crossover(closes, fast, slow)
+                decisions.append(result)
+                return result
+
+            with patch("backtest.crossover", side_effect=record_signal):
+                simulate(series[30:], Decimal(1000), Costs(Decimal(0), Decimal(0), Decimal(0)),
+                         "ma", warmup=series[:30])
+            self.assertEqual(decisions, [
+                (row["decision"], Decimal(row["sma10"]), Decimal(row["sma30"]))
+                for row in reversed(shadow.history())
+            ])
             shadow.poll(fetch, end + DAY - 1)
             self.assertEqual(len(shadow.history()), 3)
 

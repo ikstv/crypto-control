@@ -12,6 +12,15 @@ def candles(prices):
 
 
 class BacktestTests(TestCase):
+    def test_warmup_first_close_signal_fills_only_at_next_open(self):
+        series = candles([(100, 100)] * 30 + [(1, 130), (200, 220)])
+        costs = Costs(D(0), D(0), D(0))
+        result = simulate(series[30:], D(1000), costs, "ma", warmup=series[:30])
+        self.assertEqual(result["balance"], D("1100"))
+        self.assertEqual(result["trades"], 1)
+        self.assertEqual(simulate(series[30:31], D(1000), costs, "ma",
+                                  warmup=series[:30])["trades"], 0)
+
     def test_equal_averages_do_not_exit_and_final_signal_cannot_fill(self):
         prices = [(100, 100), (100, 90), (90, 110), (200, 110), (50, 90)]
         result = simulate(candles(prices), D(1000), Costs(D(0), D(0), D(0)),
