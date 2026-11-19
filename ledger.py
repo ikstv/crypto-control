@@ -287,12 +287,14 @@ class Ledger:
             )""")
 
     @staticmethod
-    def config(db):
-        row = db.execute("SELECT config FROM paper_risk WHERE id = 1").fetchone()
+    def config(db, portfolio_id=None):
+        key = "id" if portfolio_id is None else "portfolio_id"
+        row = db.execute(f"SELECT config FROM paper_risk WHERE {key} = ?",
+                         (1 if portfolio_id is None else portfolio_id,)).fetchone()
         return json.loads(row[0]) if row else DEFAULT_RISK.copy()
 
     def configure(self, **changes):
-        self._ensure_legacy_writable()
+        migrated = self._migrated()
         if set(changes) - DEFAULT_RISK.keys():
             raise ValueError("Unknown risk setting")
         for key, value in changes.items():
@@ -301,12 +303,14 @@ class Ledger:
                     raise ValueError("Pause must be boolean")
             elif not ZERO < number(value) <= 100:
                 raise ValueError("Risk thresholds must be above zero and at most 100 percent")
-        self.initialize()
-        with closing(sqlite3.connect(self.path)) as db, db:
+        if not migrated:
+            self.initialize()
+        with closing(connect(self.path)) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            config = self.config(db)
+            config = self.config(db, self.portfolio_id if migrated else None)
             config.update(changes)
-            db.execute("INSERT OR REPLACE INTO paper_risk VALUES (1, ?)", (exact_json(config),))
+            db.execute("INSERT OR REPLACE INTO paper_risk VALUES (?, ?)",
+                       (self.portfolio_id if migrated else 1, exact_json(config)))
         return config
 
     def history(self):
@@ -390,16 +394,17 @@ class Ledger:
                 KeyError, IndexError, OverflowError) as error:
             raise MarketUnavailable(f"{pair}: order book unavailable") from error
 
-    def start(self):
-        if self._migrated():
+    def start(self, *, legacy=False):
+        migrated = self._migrated()
+        if migrated and not legacy:
             return self._start_migrated()
-        self._ensure_legacy_writable()
+        scope = 1 if migrated else None
         existing = self.history()
         if existing["started"]:
             return existing
         if existing["risk"]["paused"]:
             raise MarketUnavailable("Virtual purchases are paused")
-        plan = read_portfolio(self.path)
+        plan = read_portfolio(self.path, scope)
         capital = Decimal(plan["initial_capital_minor"]) / 100
         cash = capital
         markets = self.markets()
@@ -473,16 +478,20 @@ class Ledger:
         snapshot = dict(cash_uah=cash, initial_uah=capital, initial_usdt=capital / fx["ask"],
                         skipped=skipped,
                         fx=dict(fx, pair=FX, direction="UAH_to_USDT", fee_rate=fx_fee))
-        with closing(sqlite3.connect(self.path)) as db, db:
+        with closing(connect(self.path)) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            if self.config(db)["paused"]:
+            if self.config(db, scope)["paused"]:
                 raise MarketUnavailable("Virtual purchases are paused")
             if not fresh(fx["timestamp"]) or any(not fresh(op["quote_timestamp"]) for op in operations):
                 raise MarketUnavailable("Quotes expired before saving")
             if db.execute("INSERT OR IGNORE INTO paper_start VALUES (1, ?)",
                           (exact_json(snapshot),)).rowcount:
-                db.executemany("INSERT INTO paper_operations (operation) VALUES (?)",
-                               [(exact_json(op),) for op in operations])
+                if migrated:
+                    db.executemany("INSERT INTO paper_operations (portfolio_id, operation) VALUES (1, ?)",
+                                   [(exact_json(op),) for op in operations])
+                else:
+                    db.executemany("INSERT INTO paper_operations (operation) VALUES (?)",
+                                   [(exact_json(op),) for op in operations])
         return self.history()
 
     def _start_migrated(self):
@@ -742,8 +751,8 @@ class Ledger:
             stats[f"equity_{currency.lower()}"] = equity
         return stats
 
-    def preview(self, symbol, quantity=None):
-        if self._migrated():
+    def preview(self, symbol, quantity=None, *, legacy=False):
+        if self._migrated() and not legacy:
             return self._preview_migrated(symbol, requested=quantity)
         journal = self.history()
         holdings = [op for op in journal["holdings"] if symbol in ("all", op["symbol"])]
@@ -882,33 +891,34 @@ class Ledger:
                     realized_pnl_uah=uah - sold_basis, warning=warning,
                     quote_timestamp=book["timestamp"], received_at=book["received_at"], source=book["source"])
 
-    def sell(self, symbol, operation_id, fingerprint, quantity=None):
-        if self._migrated():
+    def sell(self, symbol, operation_id, fingerprint, quantity=None, *, legacy=False):
+        migrated = self._migrated()
+        if migrated and not legacy:
             return self._sell_migrated(symbol, operation_id, fingerprint, quantity)
-        self._ensure_legacy_writable()
-        self.initialize()
-        with closing(sqlite3.connect(self.path)) as db:
-            existing = self.sale_receipt(db, operation_id, symbol)
+        scope = 1 if migrated else None
+        if not migrated:
+            self.initialize()
+        with closing(connect(self.path)) as db:
+            existing = self.sale_receipt(db, operation_id, symbol, scope)
         if existing:
             return existing
-        preview = self.preview(symbol)
+        preview = self.preview(symbol, legacy=legacy)
         if preview["fingerprint"] != fingerprint:
             raise OperationConflict("Sale terms changed. Request a new preview.")
         sales = [sale for sale in preview["sales"] if number(sale["quantity"]) > 0]
         if not sales:
             raise MarketUnavailable("No quantity can be sold at current liquidity and market limits")
-        with closing(sqlite3.connect(self.path)) as db, db:
+        with closing(connect(self.path)) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            existing = self.sale_receipt(db, operation_id, symbol)
+            existing = self.sale_receipt(db, operation_id, symbol, scope)
             if existing:
                 return existing
-            if db.execute("SELECT COUNT(*) FROM paper_sales").fetchone()[0] != preview["revision"]:
+            journal = self._read_only_history(db) if migrated else self._legacy_journal(db)
+            if journal["revision"] != preview["revision"]:
                 raise OperationConflict("Portfolio changed. Request a new preview.")
             if not fresh(preview["fx"]["timestamp"]) or any(not fresh(sale["quote_timestamp"]) for sale in sales):
                 raise MarketUnavailable("Sale quotes expired before saving")
-            cash = number(json.loads(db.execute("SELECT snapshot FROM paper_start").fetchone()[0])["cash_uah"])
-            cash += sum((number(json.loads(row[0])["net_uah"])
-                         for row in db.execute("SELECT receipt FROM paper_sales")), ZERO)
+            cash = number(journal["cash_uah"])
             stamp = now().isoformat()
             for sale in sales:
                 cash += number(sale["net_uah"])
@@ -916,7 +926,11 @@ class Ledger:
                             cash_after_uah=str(cash), fx=preview["fx"])
             receipt = dict(operation_id=operation_id, sales=sales, net_uah=preview["net_uah"],
                            skipped=[sale for sale in preview["sales"] if not number(sale["quantity"])])
-            db.execute("INSERT INTO paper_sales VALUES (?, ?, ?)", (operation_id, symbol, exact_json(receipt)))
+            if migrated:
+                db.execute("INSERT INTO paper_sales (portfolio_id, operation_id, symbol, receipt) VALUES (1, ?, ?, ?)",
+                           (operation_id, symbol, exact_json(receipt)))
+            else:
+                db.execute("INSERT INTO paper_sales VALUES (?, ?, ?)", (operation_id, symbol, exact_json(receipt)))
         return receipt
 
     def _sell_migrated(self, symbol, operation_id, fingerprint, quantity=None):

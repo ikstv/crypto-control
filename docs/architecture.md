@@ -9,6 +9,9 @@ WinForms hosts the HTML interface in WebView2. The interface talks to FastAPI on
 
 ## API
 
+The legacy API contract tests use FastAPI TestClient. Install `httpx==0.28.1`
+in the test environment alongside the runtime requirements before running them.
+
 Budgeted paper purchases are all-or-nothing. The ledger converts the budget to
 net USDT using the FX ask snapshot and fee, then fixes the gross coin quantity
 at the best crypto ask, rounded down to the market quantity step. It prices

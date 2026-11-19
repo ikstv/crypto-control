@@ -74,6 +74,16 @@ def require_paper_header(value):
         raise HTTPException(400, "Expected X-Crypto-Control: paper-start")
 
 
+def legacy_sale_fields(row):
+    if row.get("side") == "sell" and "net_uah" not in row and "net_currency" in row:
+        return {**row, "net_uah": row["net_currency"]}
+    return row
+
+
+def legacy_history_fields(journal):
+    return {**journal, "operations": [legacy_sale_fields(row) for row in journal["operations"]]}
+
+
 def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3", start_workers=True):
     quotes = Quotes()
     ledger = Ledger(db_path, fee_override=os.getenv("CRYPTO_CONTROL_TAKER_FEE_PERCENT"))
@@ -163,7 +173,7 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3", start_workers=T
 
     @app.get("/api/v1/portfolio")
     def portfolio() -> dict:
-        return read_portfolio(db_path)
+        return read_portfolio(db_path, 1)
 
     def require_migrated():
         if not ledger_schema_migrated(db_path):
@@ -242,11 +252,11 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3", start_workers=T
     @app.get("/api/v1/paper")
     def paper(response: Response) -> dict:
         response.headers["Cache-Control"] = "no-store"
-        return ledger.state()
+        return legacy_history_fields(ledger.state())
 
     @app.get("/api/v1/paper/history")
     def paper_history() -> dict:
-        return ledger.history()
+        return legacy_history_fields(ledger.history())
 
     @app.get("/api/v1/paper/observations")
     def paper_observations() -> dict:
@@ -256,7 +266,7 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3", start_workers=T
     def start_paper(x_crypto_control: str = Header()) -> dict:
         require_paper_header(x_crypto_control)
         try:
-            return ledger.start()
+            return legacy_history_fields(ledger.start(legacy=True))
         except MarketUnavailable as error:
             raise HTTPException(503, str(error)) from error
 
@@ -264,7 +274,7 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3", start_workers=T
     def sale_preview(symbol: SaleSymbol, response: Response) -> dict:
         response.headers["Cache-Control"] = "no-store"
         try:
-            return ledger.preview(symbol)
+            return ledger.preview(symbol, legacy=True)
         except MarketUnavailable as error:
             raise HTTPException(503, str(error)) from error
 
@@ -272,7 +282,11 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3", start_workers=T
     def sell(body: ConfirmSale, x_crypto_control: str = Header()) -> dict:
         require_paper_header(x_crypto_control)
         try:
-            return ledger.sell(body.symbol, body.operation_id, body.fingerprint)
+            receipt = ledger.sell(body.symbol, body.operation_id, body.fingerprint, legacy=True)
+            if receipt.get("currency") == "UAH":
+                return {**receipt, "net_uah": receipt["net_currency"],
+                        "sales": [legacy_sale_fields(row) for row in receipt["sales"]]}
+            return receipt
         except OperationConflict as error:
             raise HTTPException(409, str(error)) from error
         except MarketUnavailable as error:
