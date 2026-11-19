@@ -13,6 +13,52 @@ from test_ledger import feed
 
 
 class LegacyApiTests(TestCase):
+    def test_configure_and_start_new_portfolios(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "test.sqlite3"
+            initialize(path)
+            migrate_ledger_schema(path)
+            headers = {"X-Crypto-Control": "paper-start"}
+            with patch.object(app, "Ledger", side_effect=lambda path, **kw: Ledger(path, feed, **kw)):
+                client = TestClient(app.create_app(path, start_workers=False))
+                legacy = client.get("/api/v1/portfolio").json()
+                previous = None
+                for currency, capital in (("UAH", "1000"), ("USDT", "1000.000001")):
+                    result = client.post("/api/v1/portfolios", headers=headers, json=dict(
+                        name=currency, currency=currency, initial_capital=capital, idempotency_key=currency))
+                    self.assertEqual(result.status_code, 200)
+                    base = f'/api/v1/portfolios/{result.json()["id"]}'
+                    url = base + "/allocations"
+                    body = {"currency": currency, "allocations": [{"symbol": "BTC", "amount": capital}]}
+                    saved = client.put(url, headers=headers, json=body)
+                    self.assertEqual(saved.status_code, 200, saved.text)
+                    self.assertEqual(saved.json()["unallocated_minor"], 0)
+                    wrong_currency = "USDT" if currency == "UAH" else "UAH"
+                    self.assertEqual(client.put(url, headers=headers, json={**body, "currency": wrong_currency}).status_code, 422)
+                    for invalid in (
+                        [{"symbol": "BTC", "amount": "1001"}],
+                        [{"symbol": "BTC", "amount": "0"}],
+                        [{"symbol": "BTC", "amount": "-1"}],
+                        [{"symbol": "BTC", "amount": "0.0000001"}],
+                        [{"symbol": "UNKNOWN", "amount": "1"}],
+                        [{"symbol": "BTC", "amount": "1"}] * 2,
+                    ):
+                        self.assertEqual(client.put(url, headers=headers, json={**body, "allocations": invalid}).status_code, 422)
+                    self.assertEqual(client.get(url).json(), saved.json())
+                    started = client.post(base + "/paper/start", headers=headers)
+                    self.assertEqual(started.status_code, 200, started.text)
+                    self.assertEqual(started.json()["operations"][0]["symbol"], "BTC")
+                    self.assertEqual(client.put(url, headers=headers, json=body).status_code, 409)
+                    reopened = TestClient(app.create_app(path, start_workers=False))
+                    self.assertFalse(reopened.get(url).json()["editable"])
+                    if previous:
+                        self.assertEqual(reopened.get(previous[0]).json(), previous[1])
+                    previous = (url, reopened.get(url).json())
+                self.assertEqual(client.get("/api/v1/portfolios/999/allocations").status_code, 404)
+                self.assertEqual(client.put("/api/v1/portfolios/1/allocations", headers=headers,
+                                            json={"currency": "UAH", "allocations": []}).status_code, 409)
+                self.assertEqual(client.get("/api/v1/portfolio").json(), legacy)
+
     def test_legacy_contract_across_schema_versions(self):
         for mode in ("legacy", "migrated", "multi"):
             with self.subTest(mode=mode), TemporaryDirectory() as directory:

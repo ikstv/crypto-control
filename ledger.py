@@ -588,6 +588,12 @@ class Ledger:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM paper_start WHERE portfolio_id = ?", (self.portfolio_id,)).fetchone():
                 return self.history()
+            allocations = db.execute(
+                "SELECT symbol, allocation_minor FROM positions WHERE portfolio_id=? ORDER BY rowid",
+                (self.portfolio_id,),
+            ).fetchall()
+            if allocations != [(row["symbol"], row["allocation_minor"]) for row in plan["positions"]]:
+                raise OperationConflict("Allocations changed during start. Retry with the saved allocations.")
             if (fx is not None and not fresh(fx["timestamp"])) or any(
                     not fresh(op["quote_timestamp"]) for op in operations):
                 raise MarketUnavailable("Quotes expired before saving")

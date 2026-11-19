@@ -9,6 +9,13 @@ WinForms hosts the HTML interface in WebView2. The interface talks to FastAPI on
 
 ## API
 
+Use `GET /api/v1/portfolios/{id}/allocations` for the initial budget, current
+allocations, supported symbols, and editability. `PUT` on the same path replaces
+the entire plan using `{"currency":"UAH","allocations":[{"symbol":"BTC","amount":"1000.00"}]}`.
+Amounts use the portfolio's currency and precision. Omit a symbol to clear it,
+or send an empty list to clear the plan. Portfolio 1 and started portfolios
+return 409 on edits. Invalid allocations return 422 and unknown IDs return 404.
+
 The legacy API contract tests use FastAPI TestClient. Install `httpx==0.28.1`
 in the test environment alongside the runtime requirements before running them.
 

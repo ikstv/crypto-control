@@ -106,6 +106,33 @@ def _money_minor(raw, currency):
     return int(value * (10 ** scale))
 
 
+class AllocationsLocked(ValueError):
+    pass
+
+
+def replace_allocations(path, portfolio_id, currency, allocations):
+    with closing(connect(path)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        plan = read_portfolio(path, portfolio_id)
+        if portfolio_id == 1 or db.execute("SELECT 1 FROM paper_start WHERE portfolio_id=?",
+                                           (portfolio_id,)).fetchone():
+            raise AllocationsLocked("Allocations are locked for this portfolio")
+        if currency != plan["currency"]:
+            raise ValueError("Allocation currency must match the portfolio")
+        amounts = {}
+        for symbol, amount in allocations:
+            if symbol not in SYMBOLS or symbol in amounts:
+                raise ValueError("Allocation symbols must be supported and unique")
+            if amount > Decimal(plan["initial_capital_minor"]).scaleb(-plan["scale"]):
+                raise ValueError("Allocations exceed the initial capital")
+            amounts[symbol] = _money_minor(amount, currency)
+        if sum(amounts.values()) > plan["initial_capital_minor"]:
+            raise ValueError("Allocations exceed the initial capital")
+        db.execute("DELETE FROM positions WHERE portfolio_id=?", (portfolio_id,))
+        db.executemany("INSERT INTO positions VALUES (?, ?, ?)",
+                       [(portfolio_id, symbol, amounts[symbol]) for symbol in SYMBOLS if symbol in amounts])
+
+
 def migrate_portfolios(path):
     """Create the portfolio registry and map the legacy demo portfolio once."""
     initialize(path)

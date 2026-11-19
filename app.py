@@ -16,7 +16,8 @@ from pydantic import BaseModel, Field
 
 from portfolio import (initialize, read_portfolio, ledger_schema_migrated,
                        existing_portfolio_ids, list_existing_portfolios,
-                       create_portfolio, read_portfolio_for)
+                       create_portfolio, read_portfolio_for, replace_allocations,
+                       AllocationsLocked, SYMBOLS)
 from ledger import Ledger, MarketUnavailable, OperationConflict, LedgerSchemaMismatch, observation_slot
 from quotes import Quotes
 
@@ -49,6 +50,16 @@ class PortfolioSale(BaseModel):
     operation_id: str = Field(min_length=1, max_length=100)
     fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     quantity: Decimal | None = None
+
+
+class Allocation(BaseModel):
+    symbol: str
+    amount: Decimal = Field(gt=0)
+
+
+class PortfolioAllocations(BaseModel):
+    currency: Literal["UAH", "USDT"]
+    allocations: list[Allocation] = Field(max_length=len(SYMBOLS))
 
 
 async def history_loop(ledger, interval=300, sleep=asyncio.sleep, record=None):
@@ -216,8 +227,36 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3", start_workers=T
             return portfolio_ledger(portfolio_id).start()
         except LedgerSchemaMismatch as error:
             raise HTTPException(409, str(error)) from error
+        except OperationConflict as error:
+            raise HTTPException(409, str(error)) from error
         except MarketUnavailable as error:
             raise HTTPException(503, str(error)) from error
+
+    @app.get("/api/v1/portfolios/{portfolio_id}/allocations")
+    def portfolio_allocations(portfolio_id: int) -> dict:
+        started = portfolio_ledger(portfolio_id).history()["started"]
+        plan = read_portfolio(db_path, portfolio_id)
+        scale = plan["scale"]
+        return {**plan, "portfolio_id": portfolio_id,
+                "initial_capital": str(Decimal(plan["initial_capital_minor"]).scaleb(-scale)),
+                "allocations": [{"symbol": row["symbol"], "amount": str(Decimal(row["allocation_minor"]).scaleb(-scale))}
+                                for row in plan["positions"]],
+                "supported_symbols": SYMBOLS, "started": started,
+                "editable": portfolio_id != 1 and not started}
+
+    @app.put("/api/v1/portfolios/{portfolio_id}/allocations")
+    def save_portfolio_allocations(portfolio_id: int, body: PortfolioAllocations,
+                                   x_crypto_control: str = Header()) -> dict:
+        require_paper_header(x_crypto_control)
+        portfolio_ledger(portfolio_id)
+        try:
+            replace_allocations(db_path, portfolio_id, body.currency,
+                                [(row.symbol, row.amount) for row in body.allocations])
+        except AllocationsLocked as error:
+            raise HTTPException(409, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        return portfolio_allocations(portfolio_id)
 
     @app.get("/api/v1/portfolios/{portfolio_id}/paper/history")
     def portfolio_history(portfolio_id: int) -> dict:

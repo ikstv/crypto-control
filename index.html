@@ -31,6 +31,15 @@
       <input name="initial_capital" type="number" min="0.000001" step="0.000001" placeholder="Початковий капітал" required>
       <button type="submit">Створити портфель</button>
     </form>
+    <form id="portfolio-allocations" hidden>
+      <h3>Алокації вибраного портфеля</h3>
+      <p id="allocation-budget"></p>
+      <div id="allocation-inputs"></div>
+      <p id="allocation-total" aria-live="polite"></p>
+      <button type="submit">Зберегти алокації</button>
+      <button id="allocation-start" type="button">Почати віртуальну торгівлю для вибраного портфеля</button>
+      <p id="allocation-error" role="alert"></p>
+    </form>
   </section>
   <section>
     <h2>Віртуальна торгівля</h2>
@@ -102,8 +111,139 @@
     const selector = document.querySelector("#portfolio-selector");
     const form = document.querySelector("#portfolio-create");
     const status = document.querySelector("#portfolio-manager-status");
+    const allocationForm = document.querySelector("#portfolio-allocations");
+    const allocationInputs = document.querySelector("#allocation-inputs");
+    const allocationError = document.querySelector("#allocation-error");
+    const allocationStart = document.querySelector("#allocation-start");
+    const allocationSave = allocationForm.querySelector('[type="submit"]');
+    const commandHeaders = {"Content-Type": "application/json", "X-Crypto-Control": "paper-start"};
     let records = [];
-    async function loadPortfolios() {
+    let plan;
+    let generation = 0;
+    let saved = false;
+    let busy = false;
+    const allocationPath = id => `/api/v1/portfolios/${id}/allocations`;
+
+    function minor(value, scale) {
+      const [whole, fraction = ""] = value.split(".");
+      if (!/^\d+$/.test(whole) || !/^\d*$/.test(fraction) || fraction.length > scale) {
+        throw new Error(`Введіть додатну суму з точністю до ${scale} знаків.`);
+      }
+      return BigInt(whole + fraction.padEnd(scale, "0"));
+    }
+
+    function formatMinor(value, scale) {
+      const digits = (value < 0n ? -value : value).toString().padStart(scale + 1, "0");
+      return (value < 0n ? "−" : "") + digits.slice(0, -scale) + "," + digits.slice(-scale);
+    }
+
+    function allocationDraft() {
+      let total = 0n;
+      const allocations = [];
+      for (const input of allocationInputs.querySelectorAll("input")) {
+        if (!input.value.trim()) continue;
+        const amount = minor(input.value.trim(), plan.scale);
+        if (!amount) throw new Error("Для видалення алокації залиште поле порожнім.");
+        total += amount;
+        allocations.push({symbol: input.name, amount: input.value.trim()});
+      }
+      const remaining = minor(plan.initial_capital, plan.scale) - total;
+      document.querySelector("#allocation-total").textContent =
+        `Розподілено: ${formatMinor(total, plan.scale)} · залишок: ${formatMinor(remaining, plan.scale)} ${plan.currency}`;
+      if (remaining < 0n) throw new Error("Алокації перевищують бюджет.");
+      return allocations;
+    }
+
+    function renderAllocations(data) {
+      plan = data;
+      saved = true;
+      allocationForm.hidden = false;
+      document.querySelector("#allocation-budget").textContent =
+        `Початковий бюджет: ${data.initial_capital} ${data.currency}`;
+      const values = new Map(data.allocations.map(row => [row.symbol, row.amount]));
+      allocationInputs.replaceChildren(...data.supported_symbols.map(symbol => {
+        const label = document.createElement("label");
+        const input = document.createElement("input");
+        input.name = symbol;
+        input.inputMode = "decimal";
+        input.value = values.get(symbol) || "";
+        input.disabled = !data.editable;
+        label.append(symbol + " ", input, " ");
+        return label;
+      }));
+      allocationSave.hidden = allocationStart.hidden = !data.editable;
+      updateAllocationControls();
+    }
+
+    function updateAllocationControls() {
+      allocationError.textContent = "";
+      allocationStart.disabled = true;
+      allocationSave.disabled = true;
+      if (!plan) return;
+      try {
+        const allocations = allocationDraft();
+        allocationSave.disabled = busy || !plan.editable;
+        allocationStart.disabled = busy || !plan.editable || !saved || !allocations.length;
+      } catch (error) { allocationError.textContent = error.message; }
+    }
+
+    async function loadAllocations() {
+      const request = ++generation;
+      plan = null;
+      allocationForm.hidden = true;
+      if (!selector.value) return;
+      try {
+        const response = await fetch(allocationPath(selector.value), {cache: "no-store"});
+        if (!response.ok) throw new Error("Не вдалося прочитати алокації.");
+        const data = await response.json();
+        if (request === generation) renderAllocations(data);
+      } catch (error) { if (request === generation) status.textContent = error.message; }
+    }
+
+    allocationInputs.addEventListener("input", () => {
+      saved = false;
+      updateAllocationControls();
+    });
+    async function applyAllocationCommand(start) {
+      if (busy || !plan?.editable || (start && allocationStart.disabled)) return;
+      const id = plan.portfolio_id;
+      busy = true;
+      selector.disabled = true;
+      form.querySelector("button").disabled = true;
+      updateAllocationControls();
+      try {
+        const response = start
+          ? await fetch(`/api/v1/portfolios/${id}/paper/start`, {method: "POST", headers: commandHeaders})
+          : await fetch(allocationPath(id), {method: "PUT", headers: commandHeaders,
+              body: JSON.stringify({currency: plan.currency, allocations: allocationDraft()})});
+        const data = await response.json();
+        if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Перевірте суми алокацій.");
+        if (start) {
+          await loadAllocations();
+          status.textContent = `Віртуальну торгівлю для портфеля #${id} розпочато.`;
+        } else {
+          renderAllocations(data);
+          status.textContent = `Алокації портфеля #${id} збережено.`;
+        }
+      } catch (error) {
+        busy = false;
+        updateAllocationControls();
+        allocationError.textContent = error.message;
+      } finally {
+        if (busy) {
+          busy = false;
+          updateAllocationControls();
+        }
+        selector.disabled = false;
+        form.querySelector("button").disabled = false;
+      }
+    }
+    allocationForm.addEventListener("submit", event => {
+      event.preventDefault();
+      applyAllocationCommand(false);
+    });
+    allocationStart.addEventListener("click", () => applyAllocationCommand(true));
+    async function loadPortfolios(selected = selector.value) {
       try {
         const response = await fetch("/api/v1/portfolios", {cache: "no-store"});
         if (response.status === 409) {
@@ -113,14 +253,17 @@
         if (!response.ok) throw new Error();
         records = (await response.json()).portfolios;
         selector.replaceChildren(...records.map(item => new Option(`${item.name} · ${item.currency} · #${item.id}`, item.id)));
+        if (records.some(item => String(item.id) === String(selected))) selector.value = selected;
         selector.disabled = false;
         form.hidden = false;
         status.textContent = "Портфель вибирається лише для перегляду й підтверджених дій.";
+        await loadAllocations();
       } catch { status.textContent = "Менеджер портфелів недоступний."; }
     }
     selector.addEventListener("change", () => {
       const item = records.find(row => String(row.id) === selector.value);
       if (item) status.textContent = `${item.name} · ${item.currency} · початковий капітал ${item.initial_capital_minor / 10 ** item.scale}`;
+      loadAllocations();
     });
     form.addEventListener("submit", async event => {
       event.preventDefault();
@@ -134,7 +277,7 @@
         if (!response.ok) throw new Error(result.detail || "Не вдалося створити портфель");
         status.textContent = `Створено ${result.name} · ${result.currency}. Інші портфелі не змінено.`;
         form.reset();
-        await loadPortfolios();
+        await loadPortfolios(result.id);
       } catch (error) { status.textContent = error.message; }
       finally { button.disabled = false; }
     });
