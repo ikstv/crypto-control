@@ -458,6 +458,14 @@ class Ledger:
         return [dict(zip(keys, row)) for row in rows]
 
     def record_skip(self, reason, slot=None, status="unavailable"):
+        if self._migrated():
+            stamp = now()
+            slot = slot or stamp.replace(second=0, microsecond=0).isoformat()
+            with closing(sqlite3.connect(self.path)) as db, db:
+                inserted = db.execute("""INSERT OR IGNORE INTO paper_observations
+                    (portfolio_id, slot, observed_at, status, reason) VALUES (?, ?, ?, ?, ?)""",
+                    (self.portfolio_id, slot, stamp.isoformat(), status, reason)).rowcount
+            return {"status": status if inserted else "duplicate", "reason": reason}
         self._ensure_legacy_writable()
         stamp = now()
         slot = slot or stamp.replace(second=0, microsecond=0).isoformat()
@@ -468,6 +476,8 @@ class Ledger:
         return {"status": status if inserted else "duplicate", "reason": reason}
 
     def record_valuation(self, slot=None):
+        if self._migrated():
+            return self._record_valuation_migrated(slot)
         self._ensure_legacy_writable()
         journal = self.history()
         if not journal["started"]:
@@ -487,6 +497,43 @@ class Ledger:
                      str(stats["max_drawdown_percent"]), str(stats["daily_pnl_percent"]))).rowcount
             return {"status": "recorded" if inserted else "duplicate",
                     "equity_uah": str(valuation["net_uah"])}
+        except (MarketUnavailable, OperationConflict, InvalidOperation, ValueError, KeyError) as error:
+            reason = str(error)
+            status = "stale" if "stale" in reason.lower() or "expired" in reason.lower() else "unavailable"
+            return self.record_skip(reason, slot, status)
+
+    def _record_valuation_migrated(self, slot=None):
+        journal = self.history()
+        stamp = now()
+        slot = slot or stamp.replace(second=0, microsecond=0).isoformat()
+        if not journal["started"]:
+            return self.record_skip("Virtual trading has not started", slot)
+        try:
+            plan = read_portfolio(self.path, self.portfolio_id)
+            preview = self.preview("all")
+            cash_key = "cash_uah" if plan["currency"] == "UAH" else "cash_usdt"
+            cash = number(journal.get(cash_key, "0"))
+            proceeds = sum((number(sale["net_currency"]) for sale in preview["sales"]), ZERO)
+            equity = cash + proceeds
+            initial = Decimal(plan["initial_capital_minor"]) / (Decimal(10) ** plan["scale"])
+            with closing(sqlite3.connect(self.path)) as db, db:
+                prior = [number(row[0]) for row in db.execute(
+                    "SELECT equity_uah FROM paper_equity WHERE portfolio_id=? ORDER BY id", (self.portfolio_id,))]
+                peak = max([initial, *prior, equity])
+                drawdown = (peak - equity) / peak * 100 if peak else ZERO
+                inserted = db.execute("""INSERT OR IGNORE INTO paper_observations
+                    (portfolio_id, slot, observed_at, status, equity_uah,
+                     max_drawdown_percent, daily_pnl_percent)
+                    VALUES (?, ?, ?, 'recorded', ?, ?, ?)""",
+                    (self.portfolio_id, slot, stamp.isoformat(), str(equity), str(drawdown), "0")).rowcount
+                if inserted:
+                    db.execute("""INSERT INTO paper_equity
+                        (portfolio_id, observed_at, day, equity_uah, equity_currency)
+                        VALUES (?, ?, ?, ?, ?)""",
+                        (self.portfolio_id, stamp.isoformat(), stamp.date().isoformat(), str(equity), plan["currency"]))
+            return {"status": "recorded" if inserted else "duplicate",
+                    "equity": str(equity), "currency": plan["currency"],
+                    "max_drawdown_percent": str(drawdown)}
         except (MarketUnavailable, OperationConflict, InvalidOperation, ValueError, KeyError) as error:
             reason = str(error)
             status = "stale" if "stale" in reason.lower() or "expired" in reason.lower() else "unavailable"

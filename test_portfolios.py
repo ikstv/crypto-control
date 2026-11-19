@@ -198,6 +198,24 @@ class PortfolioTests(unittest.TestCase):
         self.assertEqual(receipt["currency"], "UAH")
         self.assertIn("realized_pnl", receipt)
 
+    def test_migrated_observations_and_drawdown_are_isolated_by_portfolio(self):
+        other_id = self._migrated_with_usdt()
+        uah = Ledger(self.path, feed, portfolio_id=1)
+        usdt = Ledger(self.path, feed, portfolio_id=other_id)
+        uah.start()
+        usdt.start()
+        slot = "2026-11-19T12:00:00+00:00"
+        first_uah = uah.record_valuation(slot=slot)
+        first_usdt = usdt.record_valuation(slot=slot)
+        duplicate = usdt.record_valuation(slot=slot)
+        self.assertEqual(first_uah["status"], "recorded")
+        self.assertEqual(first_usdt["status"], "recorded")
+        self.assertEqual(duplicate["status"], "duplicate")
+        self.assertEqual(len(uah.observation_history()), 1)
+        self.assertEqual(len(usdt.observation_history()), 1)
+        reopened = Ledger(self.path, portfolio_id=other_id)
+        self.assertEqual(len(reopened.observation_history()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

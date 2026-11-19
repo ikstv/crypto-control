@@ -14,6 +14,16 @@ def connect(path):
     return db
 
 
+def ledger_schema_migrated(path):
+    with closing(connect(path)) as db:
+        return "portfolio_id" in {row[1] for row in db.execute("PRAGMA table_info(settings)")}
+
+
+def existing_portfolio_ids(path):
+    with closing(connect(path)) as db:
+        return [row[0] for row in db.execute("SELECT id FROM portfolios ORDER BY id")]
+
+
 def initialize(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(connect(path)) as db, db:
@@ -212,6 +222,10 @@ def migrate_ledger_schema(path):
             raise ValueError("Missing legacy settings table")
         columns = {row[1] for row in raw.execute("PRAGMA table_info(settings)")}
         if "portfolio_id" in columns:
+            equity_columns = {row[1] for row in raw.execute("PRAGMA table_info(paper_equity)")} if "paper_equity" in tables else set()
+            if "equity_currency" not in equity_columns and "paper_equity" in tables:
+                raw.execute("ALTER TABLE paper_equity ADD COLUMN equity_currency TEXT NOT NULL DEFAULT 'UAH'")
+                raw.commit()
             raw.rollback()
             return {"status": "already_migrated"}
 
@@ -253,7 +267,8 @@ def migrate_ledger_schema(path):
         )""")
         raw.execute("""CREATE TABLE paper_equity (
             id INTEGER PRIMARY KEY, portfolio_id INTEGER NOT NULL REFERENCES portfolios(id),
-            observed_at TEXT NOT NULL, day TEXT NOT NULL, equity_uah TEXT NOT NULL
+            observed_at TEXT NOT NULL, day TEXT NOT NULL, equity_uah TEXT NOT NULL,
+            equity_currency TEXT NOT NULL CHECK (equity_currency IN ('UAH', 'USDT'))
         )""")
         raw.execute("""CREATE TABLE paper_observations (
             portfolio_id INTEGER NOT NULL REFERENCES portfolios(id), slot TEXT NOT NULL,
@@ -280,7 +295,7 @@ def migrate_ledger_schema(path):
         if "paper_risk" in renamed:
             raw.execute("INSERT INTO paper_risk SELECT 1, config FROM __legacy_paper_risk")
         if "paper_equity" in renamed:
-            raw.execute("INSERT INTO paper_equity SELECT id, 1, observed_at, day, equity_uah FROM __legacy_paper_equity")
+            raw.execute("INSERT INTO paper_equity (id, portfolio_id, observed_at, day, equity_uah, equity_currency) SELECT id, 1, observed_at, day, equity_uah, 'UAH' FROM __legacy_paper_equity")
         if "paper_observations" in renamed:
             raw.execute("""INSERT INTO paper_observations
                 SELECT 1, slot, observed_at, status, reason, equity_uah,

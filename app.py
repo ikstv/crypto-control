@@ -5,6 +5,7 @@ from shadow import Shadow, SOURCE
 from algorithm import Algorithm, Blocked
 import os
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from pathlib import Path
 from decimal import Decimal
 from typing import Literal
@@ -13,7 +14,7 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from portfolio import initialize, read_portfolio
+from portfolio import initialize, read_portfolio, ledger_schema_migrated, existing_portfolio_ids
 from ledger import Ledger, MarketUnavailable, OperationConflict
 from quotes import Quotes
 
@@ -41,6 +42,14 @@ async def history_loop(ledger, interval=300, sleep=asyncio.sleep, record=None):
             await asyncio.to_thread(ledger.record_valuation)
         else:
             await record()
+        await sleep(interval)
+
+
+async def all_portfolio_history_loop(db_path, fetch, interval=300, sleep=asyncio.sleep):
+    while True:
+        slot = datetime.now(timezone.utc).replace(second=0, microsecond=0).isoformat()
+        for portfolio_id in existing_portfolio_ids(db_path):
+            await asyncio.to_thread(Ledger(db_path, fetch, portfolio_id=portfolio_id).record_valuation, slot)
         await sleep(interval)
 
 
@@ -77,7 +86,10 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3"):
         initialize(db_path)
         ledger.initialize()
         quote_worker = asyncio.create_task(poll_quotes())
-        history_worker = asyncio.create_task(history_loop(ledger))
+        history_worker = asyncio.create_task(
+            all_portfolio_history_loop(db_path, quotes.fetch) if ledger_schema_migrated(db_path)
+            else history_loop(ledger)
+        )
         shadow_worker = asyncio.create_task(poll_shadow())
         try:
             yield
