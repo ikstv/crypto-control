@@ -74,3 +74,24 @@ class LedgerTests(unittest.TestCase):
             {"price": "100", "quantity": "0.10"},
             {"price": "101", "quantity": "0.1482"},
         ])
+
+    def test_record_valuation_is_idempotent_and_history_is_read_only(self):
+        ledger = Ledger(self.path, feed)
+        ledger.start()
+        before = ledger.observation_history()
+        first = ledger.record_valuation(slot="2026-11-19T12:00:00Z")
+        second = ledger.record_valuation(slot="2026-11-19T12:00:00Z")
+        self.assertEqual(first["status"], "recorded")
+        self.assertEqual(second["status"], "duplicate")
+        self.assertEqual(len(ledger.observation_history()), len(before) + 1)
+        ledger.state()
+        self.assertEqual(len(ledger.observation_history()), len(before) + 1)
+
+    def test_record_skip_preserves_gap_reason(self):
+        ledger = Ledger(self.path, feed)
+        ledger.start()
+        result = ledger.record_skip("WhiteBIT unavailable", slot="2026-11-19T12:05:00Z")
+        self.assertEqual(result, {"status": "unavailable", "reason": "WhiteBIT unavailable"})
+        row = ledger.observation_history()[-1]
+        self.assertEqual(row["status"], "unavailable")
+        self.assertEqual(row["reason"], "WhiteBIT unavailable")

@@ -99,6 +99,11 @@ class Ledger:
                 id INTEGER PRIMARY KEY, observed_at TEXT NOT NULL,
                 day TEXT NOT NULL, equity_uah TEXT NOT NULL
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS paper_observations (
+                slot TEXT PRIMARY KEY, observed_at TEXT NOT NULL,
+                status TEXT NOT NULL, reason TEXT, equity_uah TEXT,
+                max_drawdown_percent TEXT, daily_pnl_percent TEXT
+            )""")
 
     @staticmethod
     def config(db):
@@ -136,7 +141,8 @@ class Ledger:
             )]
             risk = self.config(db)
         extra = dict(risk=risk, revision=len(receipts), realized_pnl_uah="0",
-                     holdings=[], operations=operations)
+                     holdings=[], operations=operations,
+                     observations=self.observation_history())
         if start is None:
             return dict(started=False, cash_uah=str(capital), **extra)
         snapshot = json.loads(start[0])
@@ -283,7 +289,7 @@ class Ledger:
         try:
             with self._balance_lock:
                 valuation = self.value(journal)
-                valuation.update(self.record_equity(journal, valuation["net_uah"]))
+                valuation.update(self.record_equity(journal, valuation["net_uah"], persist=False))
                 current = snapshot(journal, valuation, now().isoformat())
                 previous = self._previous_balance
                 valuation["balance_change"] = explain(previous, current) if previous else None
@@ -291,6 +297,49 @@ class Ledger:
         except (MarketUnavailable, OperationConflict, InvalidOperation, ValueError, KeyError) as error:
             return dict(journal, valuation=None, warning=str(error))
         return dict(journal, valuation=decode(valuation), warning=None)
+
+    def observation_history(self):
+        self.initialize()
+        with closing(sqlite3.connect(self.path)) as db:
+            rows = db.execute("""SELECT slot, observed_at, status, reason, equity_uah,
+                max_drawdown_percent, daily_pnl_percent
+                FROM paper_observations ORDER BY slot""").fetchall()
+        keys = ("slot", "observed_at", "status", "reason", "equity_uah",
+                "max_drawdown_percent", "daily_pnl_percent")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def record_skip(self, reason, slot=None, status="unavailable"):
+        stamp = now()
+        slot = slot or stamp.replace(second=0, microsecond=0).isoformat()
+        with closing(sqlite3.connect(self.path)) as db, db:
+            inserted = db.execute("""INSERT OR IGNORE INTO paper_observations
+                (slot, observed_at, status, reason) VALUES (?, ?, ?, ?)""",
+                (slot, stamp.isoformat(), status, reason)).rowcount
+        return {"status": status if inserted else "duplicate", "reason": reason}
+
+    def record_valuation(self, slot=None):
+        journal = self.history()
+        if not journal["started"]:
+            return self.record_skip("Virtual trading has not started", slot)
+        stamp = now()
+        slot = slot or stamp.replace(second=0, microsecond=0).isoformat()
+        try:
+            with self._balance_lock:
+                valuation = self.value(journal)
+                stats = self.record_equity(journal, valuation["net_uah"], persist=False)
+            with closing(sqlite3.connect(self.path)) as db, db:
+                inserted = db.execute("""INSERT OR IGNORE INTO paper_observations
+                    (slot, observed_at, status, equity_uah,
+                     max_drawdown_percent, daily_pnl_percent)
+                    VALUES (?, ?, 'recorded', ?, ?, ?)""",
+                    (slot, stamp.isoformat(), str(valuation["net_uah"]),
+                     str(stats["max_drawdown_percent"]), str(stats["daily_pnl_percent"]))).rowcount
+            return {"status": "recorded" if inserted else "duplicate",
+                    "equity_uah": str(valuation["net_uah"])}
+        except (MarketUnavailable, OperationConflict, InvalidOperation, ValueError, KeyError) as error:
+            reason = str(error)
+            status = "stale" if "stale" in reason.lower() or "expired" in reason.lower() else "unavailable"
+            return self.record_skip(reason, slot, status)
 
     def value(self, journal):
         if not journal["holdings"]:
@@ -333,7 +382,7 @@ class Ledger:
             positions=details,
         )
 
-    def record_equity(self, journal, equity):
+    def record_equity(self, journal, equity, persist=True):
         stamp = now()
         # The daily boundary is explicitly UTC on every Windows installation.
         day = stamp.date().isoformat()
@@ -343,12 +392,16 @@ class Ledger:
             if revision != journal["revision"]:
                 raise OperationConflict("Portfolio changed during valuation. Refresh the estimate.")
             rows = db.execute("SELECT day, equity_uah FROM paper_equity ORDER BY id").fetchall()
-            db.execute("INSERT INTO paper_equity (observed_at, day, equity_uah) VALUES (?, ?, ?)",
-                       (stamp.isoformat(), day, str(equity)))
+            if persist:
+                db.execute("INSERT INTO paper_equity (observed_at, day, equity_uah) VALUES (?, ?, ?)",
+                           (stamp.isoformat(), day, str(equity)))
         peak = number(journal["initial_uah"])
         maximum = ZERO
-        daily_open = next((number(value) for date, value in rows if date == day), equity)
-        for _, value in rows + [(day, str(equity))]:
+        prior = []
+        if self._previous_balance is not None:
+            prior.append((day, str(self._previous_balance["net"])))
+        daily_open = next((number(value) for date, value in rows + prior if date == day), equity)
+        for _, value in rows + prior + [(day, str(equity))]:
             peak = max(peak, number(value))
             maximum = max(maximum, (peak - number(value)) / peak * 100)
         daily_pnl = (equity - daily_open) / daily_open * 100 if daily_open else ZERO

@@ -30,6 +30,16 @@ class RiskSettings(BaseModel):
     target_percent: Decimal = Field(gt=0, le=100)
 
 
+async def history_loop(ledger, interval=300, sleep=asyncio.sleep, record=None):
+    """Record persisted observations until the FastAPI lifespan cancels us."""
+    while True:
+        if record is None:
+            await asyncio.to_thread(ledger.record_valuation)
+        else:
+            await record()
+        await sleep(interval)
+
+
 def require_paper_header(value):
     if value != "paper-start":
         raise HTTPException(400, "Expected X-Crypto-Control: paper-start")
@@ -48,13 +58,17 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3"):
     async def lifespan(app):
         initialize(db_path)
         ledger.initialize()
-        worker = asyncio.create_task(poll_quotes())
+        quote_worker = asyncio.create_task(poll_quotes())
+        history_worker = asyncio.create_task(history_loop(ledger))
         try:
             yield
         finally:
-            worker.cancel()
+            quote_worker.cancel()
+            history_worker.cancel()
             with suppress(asyncio.CancelledError):
-                await worker
+                await quote_worker
+            with suppress(asyncio.CancelledError):
+                await history_worker
 
     app = FastAPI(title="Crypto Control", version="1.0.0", lifespan=lifespan)
 
@@ -83,6 +97,10 @@ def create_app(db_path=ROOT / "data" / "crypto_control.sqlite3"):
     @app.get("/api/v1/paper/history")
     def paper_history() -> dict:
         return ledger.history()
+
+    @app.get("/api/v1/paper/observations")
+    def paper_observations() -> dict:
+        return {"observations": ledger.observation_history()}
 
     @app.post("/api/v1/paper/start")
     def start_paper(x_crypto_control: str = Header()) -> dict:
