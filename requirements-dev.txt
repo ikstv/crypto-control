@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Starlette's TestClient backend (test-only; not required by the running Engine).
+httpx2==2.16.2

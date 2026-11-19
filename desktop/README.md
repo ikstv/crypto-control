@@ -39,6 +39,14 @@ Installation registers a Task Scheduler job for the current user. Use `-Action s
 
 ## Tests
 
+Install the test-only dependencies into the project virtual environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+```
+
+Then run the test suite from the repository root:
+
 ```powershell
 .\.venv\Scripts\python.exe -m unittest -v
 ```
