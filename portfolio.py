@@ -111,34 +111,38 @@ def migrate_portfolios(path):
     initialize(path)
     with closing(connect(path)) as db, db:
         db.execute("BEGIN IMMEDIATE")
-        db.execute("""CREATE TABLE IF NOT EXISTS portfolios (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 100),
-            currency TEXT NOT NULL CHECK (currency IN ('UAH', 'USDT')),
-            initial_capital_minor INTEGER NOT NULL CHECK (initial_capital_minor > 0),
-            scale INTEGER NOT NULL CHECK (scale IN (2, 6)),
-            idempotency_key TEXT UNIQUE,
-            created_at TEXT NOT NULL,
-            CHECK ((currency = 'UAH' AND scale = 2) OR (currency = 'USDT' AND scale = 6))
-        )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS portfolio_observations (
-            portfolio_id INTEGER NOT NULL REFERENCES portfolios(id) ON DELETE CASCADE,
-            slot TEXT NOT NULL,
-            observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            status TEXT NOT NULL,
-            reason TEXT,
-            equity_minor INTEGER,
-            PRIMARY KEY (portfolio_id, slot)
-        )""")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_observations_portfolio ON portfolio_observations(portfolio_id, slot)")
-        row = db.execute("SELECT id FROM portfolios WHERE id = 1").fetchone()
-        if row is None:
-            capital = db.execute("SELECT capital_minor FROM settings WHERE id = 1").fetchone()[0]
-            db.execute("""INSERT INTO portfolios
-                (id, name, currency, initial_capital_minor, scale, idempotency_key, created_at)
-                VALUES (1, 'Main portfolio', 'UAH', ?, 2, 'legacy-main', ?)""",
-                (capital, datetime.now(timezone.utc).isoformat()))
-        return {"legacy_id": 1}
+        return _create_portfolio_registry(db)
+
+
+def _create_portfolio_registry(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS portfolios (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 100),
+        currency TEXT NOT NULL CHECK (currency IN ('UAH', 'USDT')),
+        initial_capital_minor INTEGER NOT NULL CHECK (initial_capital_minor > 0),
+        scale INTEGER NOT NULL CHECK (scale IN (2, 6)),
+        idempotency_key TEXT UNIQUE,
+        created_at TEXT NOT NULL,
+        CHECK ((currency = 'UAH' AND scale = 2) OR (currency = 'USDT' AND scale = 6))
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS portfolio_observations (
+        portfolio_id INTEGER NOT NULL REFERENCES portfolios(id) ON DELETE CASCADE,
+        slot TEXT NOT NULL,
+        observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        status TEXT NOT NULL,
+        reason TEXT,
+        equity_minor INTEGER,
+        PRIMARY KEY (portfolio_id, slot)
+    )""")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_observations_portfolio ON portfolio_observations(portfolio_id, slot)")
+    row = db.execute("SELECT id FROM portfolios WHERE id = 1").fetchone()
+    if row is None:
+        capital = db.execute("SELECT capital_minor FROM settings WHERE id = 1").fetchone()[0]
+        db.execute("""INSERT INTO portfolios
+            (id, name, currency, initial_capital_minor, scale, idempotency_key, created_at)
+            VALUES (1, 'Main portfolio', 'UAH', ?, 2, 'legacy-main', ?)""",
+            (capital, datetime.now(timezone.utc).isoformat()))
+    return {"legacy_id": 1}
 
 
 def list_portfolios(path):
@@ -227,9 +231,10 @@ def migrate_ledger_schema(path):
     This function is deliberately not called by application startup. Callers must
     create and verify a backup/copy before invoking it.
     """
-    migrate_portfolios(path)
-    raw = sqlite3.connect(path)
+    raw = sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True)
     try:
+        # Table renames temporarily detach ledger rows from their final schema.
+        # Check all foreign keys on the rebuilt schema before committing.
         raw.execute("PRAGMA foreign_keys=OFF")
         raw.execute("BEGIN IMMEDIATE")
         tables = {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -240,10 +245,11 @@ def migrate_ledger_schema(path):
             equity_columns = {row[1] for row in raw.execute("PRAGMA table_info(paper_equity)")} if "paper_equity" in tables else set()
             if "equity_currency" not in equity_columns and "paper_equity" in tables:
                 raw.execute("ALTER TABLE paper_equity ADD COLUMN equity_currency TEXT NOT NULL DEFAULT 'UAH'")
-                raw.commit()
-            raw.rollback()
+            _check_migration(raw)
+            raw.commit()
             return {"status": "already_migrated"}
 
+        _create_portfolio_registry(raw)
         renamed = set()
         for table in ("settings", "positions", "history", "paper_start", "paper_operations",
                       "paper_sales", "paper_risk", "paper_equity", "paper_observations"):
@@ -323,6 +329,7 @@ def migrate_ledger_schema(path):
                       "paper_sales", "paper_risk", "paper_equity", "paper_observations"):
             if table in renamed:
                 raw.execute(f'DROP TABLE "__legacy_{table}"')
+        _check_migration(raw)
         raw.commit()
     except Exception:
         raw.rollback()
@@ -330,9 +337,11 @@ def migrate_ledger_schema(path):
     finally:
         raw.execute("PRAGMA foreign_keys=ON")
         raw.close()
-    with closing(connect(path)) as check:
-        if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise ValueError("SQLite integrity check failed after ledger migration")
-        if check.execute("PRAGMA foreign_key_check").fetchone() is not None:
-            raise ValueError("Foreign key check failed after ledger migration")
     return {"status": "migrated", "legacy_id": 1}
+
+
+def _check_migration(db):
+    if db.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+        raise ValueError("SQLite integrity check failed after ledger migration")
+    if db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise ValueError("Foreign key check failed after ledger migration")

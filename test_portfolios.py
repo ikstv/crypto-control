@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from contextlib import closing
 from decimal import Decimal
+from unittest.mock import patch
 
 from portfolio import (
     connect,
@@ -22,6 +23,47 @@ from test_ledger import feed
 
 
 class PortfolioTests(unittest.TestCase):
+    def test_migration_failure_restores_complete_source_and_allows_retry(self):
+        markers = ("INSERT INTO portfolios", 'ALTER TABLE "positions"',
+                   "CREATE INDEX idx_sales_portfolio", "PRAGMA integrity_check", "PRAGMA foreign_key_check")
+        for index, marker in enumerate(markers):
+            with self.subTest(marker=marker):
+                path = self.path.with_name(f"fault-{index}.db")
+                initialize(path)
+                ledger = Ledger(path, feed)
+                ledger.start()
+                receipt = ledger.sell("BTC", "before", ledger.preview("BTC")["fingerprint"])
+                ledger.record_valuation()
+                def snapshot():
+                    with closing(connect(path)) as db:
+                        self.assertEqual(db.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
+                        self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+                        return list(db.iterdump())
+
+                original = snapshot()
+                state = ledger.history()
+                real_connect = sqlite3.connect
+
+                class FaultConnection(sqlite3.Connection):
+                    def execute(self, sql, *args):
+                        if sql.startswith(marker):
+                            raise sqlite3.OperationalError("injected migration failure")
+                        return super().execute(sql, *args)
+
+                with patch("portfolio.sqlite3.connect", side_effect=lambda *a, **kw:
+                           real_connect(*a, factory=FaultConnection, **kw)):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "injected"):
+                        migrate_ledger_schema(path)
+                self.assertEqual(snapshot(), original)
+                self.assertEqual(ledger.history(), state)
+                self.assertEqual(migrate_ledger_schema(path)["status"], "migrated")
+                migrated = snapshot()
+                self.assertEqual(migrate_ledger_schema(path)["status"], "already_migrated")
+                self.assertEqual(snapshot(), migrated)
+                self.assertEqual(ledger.sell("BTC", "before", "ignored"), receipt)
+                for key in ("cash_uah", "holdings", "operations", "realized_pnl_uah", "observations"):
+                    self.assertEqual(ledger.history()[key], state[key])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / "portfolio.sqlite3"
