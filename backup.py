@@ -62,11 +62,15 @@ def copy_snapshot(source, destination, expected=None):
                 if content_digest(dest) != digest:
                     raise ValueError("Restored schema or data differ from the source")
         # Publish a complete file without overwriting a concurrent restore.
-        if os.name == "nt":
-            staged.rename(destination)
-        else:
-            os.link(staged, destination)
+        publish_file(staged, destination)
     return digest
+
+
+def publish_file(staged, destination):
+    if os.name == "nt":
+        staged.rename(destination)
+    else:
+        os.link(staged, destination)
 
 
 def checksum_file(backup):
@@ -76,13 +80,23 @@ def checksum_file(backup):
 def create_backup(source=DATABASE, directory=BACKUPS):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup = directory / f"crypto-control-{stamp}.sqlite3"
-    digest = copy_snapshot(source, backup)
-    try:
-        with checksum_file(backup).open("x", encoding="ascii") as checksum:
+    directory.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".crypto-backup-", dir=directory) as staging:
+        staged = Path(staging) / "snapshot.sqlite3"
+        digest = copy_snapshot(source, staged)
+        staged_checksum = checksum_file(staged)
+        with staged_checksum.open("x", encoding="ascii") as checksum:
             checksum.write(digest + "\n")
-    except BaseException:
-        backup.unlink(missing_ok=True)
-        raise
+            checksum.flush()
+            os.fsync(checksum.fileno())
+        published_checksum = checksum_file(backup)
+        publish_file(staged_checksum, published_checksum)
+        try:
+            # The final SQLite name marks readiness. Its checksum already exists.
+            publish_file(staged, backup)
+        except OSError:
+            published_checksum.unlink()
+            raise
     return backup
 
 

@@ -24,6 +24,51 @@ class BackupTests(unittest.TestCase):
     def create(self):
         return create_backup(self.source, self.root / "backups")
 
+    def test_process_exit_during_backup_publication(self):
+        script = """
+import os
+import sys
+from pathlib import Path
+from unittest.mock import patch
+from backup import create_backup
+
+source, directory = map(Path, sys.argv[1:3])
+phase, timing = sys.argv[3:]
+publish = Path.rename if os.name == "nt" else os.link
+
+def interrupted(src, dest, *args, **kwargs):
+    dest = Path(dest)
+    kind = ("checksum" if dest.suffix == ".sha256" else "database") if dest.parent == directory else "staging"
+    if kind == phase and timing == "before":
+        os._exit(73)
+    result = publish(src, dest, *args, **kwargs)
+    if kind == phase and timing == "after":
+        os._exit(73)
+    return result
+
+with patch.object(Path if os.name == "nt" else os, "rename" if os.name == "nt" else "link", interrupted):
+    create_backup(source, directory)
+"""
+        for phase, timing in (("staging", "before"), ("staging", "after"),
+                              ("checksum", "before"), ("checksum", "after"),
+                              ("database", "before"), ("database", "after")):
+            with self.subTest(phase=phase, timing=timing):
+                directory = self.root / f"{phase}-{timing}"
+                previous = create_backup(self.source, directory)
+                result = subprocess.run(
+                    [sys.executable, "-B", "-c", script, str(self.source), str(directory), phase, timing],
+                    capture_output=True, timeout=20,
+                )
+                published = [path for path in directory.glob("crypto-control-*.sqlite3") if path != previous]
+                if (phase, timing) == ("database", "after"):
+                    self.assertEqual(len(published), 1)
+                    self.assertEqual(verify_backup(published[0])["integrity"], "ok")
+                else:
+                    self.assertEqual(published, [])
+                self.assertEqual(result.returncode, 73, result.stderr.decode(errors="replace"))
+                self.assertEqual(verify_backup(previous)["integrity"], "ok")
+                self.assertEqual(verify_backup(create_backup(self.source, directory))["integrity"], "ok")
+
     def test_migrated_wal_restores_portfolios_and_sale_receipts(self):
         migrate_ledger_schema(self.source)
         other = create_portfolio(self.source, "USD test", "USDT", "1000", "backup-other", migrate=False)
