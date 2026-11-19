@@ -172,6 +172,22 @@ class PortfolioTests(unittest.TestCase):
         result = Ledger(self.path, no_fx, portfolio_id=other_id).start()
         self.assertTrue(result["started"])
 
+    def test_migrated_uah_start_rejects_insufficient_fx_depth_without_writes(self):
+        self._migrated_with_usdt()
+        with closing(connect(self.path)) as db, db:
+            db.execute("UPDATE positions SET allocation_minor=100000 WHERE portfolio_id=1 AND symbol='BTC'")
+        def thin_fx(endpoint):
+            data = feed(endpoint)
+            if endpoint.startswith("orderbook/USDT_UAH"):
+                data["asks"] = [["40", "1"], ["41", "1"]]
+            return data
+
+        with self.assertRaises(MarketUnavailable):
+            Ledger(self.path, thin_fx, portfolio_id=1).start()
+        self.assertFalse(Ledger(self.path, portfolio_id=1).history()["started"])
+        with closing(connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM paper_operations").fetchone()[0], 0)
+
     def test_migrated_usdt_partial_and_full_sales_isolated(self):
         other_id = self._migrated_with_usdt()
         ledger = Ledger(self.path, feed, portfolio_id=other_id)

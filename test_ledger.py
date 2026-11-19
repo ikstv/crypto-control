@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from ledger import Ledger, MarketUnavailable
@@ -20,6 +21,16 @@ def feed(endpoint, bid="99", fx=True):
 
 
 class LedgerTests(unittest.TestCase):
+    def test_single_level_fx_purchase_reconciles_cash_and_fees(self):
+        result = Ledger(self.path, feed).start()
+        purchase, = result["operations"]
+        self.assertEqual(Decimal(result["cash_uah"]), Decimal("9000.20"))
+        self.assertEqual(Decimal(purchase["debit_uah"]), Decimal("999.80"))
+        self.assertEqual(Decimal(purchase["fx_received_usdt"]), Decimal("24.97"))
+        self.assertEqual(Decimal(purchase["fx_fee_usdt"]), Decimal("24.97") / Decimal("0.999") - Decimal("24.97"))
+        self.assertEqual(Decimal(purchase["quantity"]), Decimal("0.2494503"))
+        self.assertEqual(Decimal(purchase["fee_base"]), Decimal("0.0002497"))
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -62,18 +73,60 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("stale", state["warning"])
         self.assertEqual(state["operations"], first["operations"])
 
-    def test_purchase_uses_more_than_one_ask_level(self):
+    def test_purchase_rejects_full_target_when_second_ask_exceeds_budget(self):
         def depth(endpoint):
             data = feed(endpoint)
             if "BTC_USDT" in endpoint:
                 data["asks"] = [["100", "0.10"], ["101", "1"]]
             return data
 
-        operation, = Ledger(self.path, depth).start()["operations"]
-        self.assertEqual(operation["fills"], [
-            {"price": "100", "quantity": "0.10"},
-            {"price": "101", "quantity": "0.1482"},
-        ])
+        ledger = Ledger(self.path, depth)
+        before = ledger.state()
+        with self.assertRaisesRegex(MarketUnavailable, "exceeds the USDT budget"):
+            ledger.start()
+        self.assertEqual(Ledger(self.path, depth).state(), before)
+
+    def test_uah_start_prices_the_entire_fx_conversion_across_ask_levels(self):
+        def depth(endpoint):
+            data = feed(endpoint)
+            if endpoint.startswith("orderbook/USDT_UAH"):
+                data["asks"] = [["40", "10"], ["41", "1000"]]
+            return data
+
+        result = Ledger(self.path, depth).start()
+        spent = sum((Decimal(op["debit_uah"]) for op in result["operations"]), Decimal(0))
+        self.assertEqual(spent + Decimal(result["cash_uah"]), Decimal("10000"))
+        self.assertEqual(Decimal(result["operations"][0]["debit_uah"]), Decimal("999.61"))
+        self.assertEqual(Decimal(result["operations"][0]["fx_acquired_usdt"]), Decimal("24.60") / Decimal("0.999"))
+        self.assertEqual(Decimal(result["operations"][0]["fx_received_usdt"]), Decimal("24.60"))
+        self.assertEqual(Decimal(result["operations"][0]["total_usdt"]), Decimal("24.60"))
+        self.assertEqual(Decimal(result["operations"][0]["unused_usdt"]), Decimal("0"))
+        self.assertGreater(Decimal(result["operations"][0]["fx_worst_price"]), Decimal("40"))
+
+    def test_uah_start_rejects_insufficient_multilevel_fx_depth_atomically(self):
+        def thin_fx(endpoint):
+            data = feed(endpoint)
+            if endpoint.startswith("orderbook/USDT_UAH"):
+                data["asks"] = [["40", "0.5"], ["41", "0.5"]]
+            return data
+
+        with self.assertRaises(MarketUnavailable):
+            Ledger(self.path, thin_fx).start()
+        self.assertFalse(Ledger(self.path).history()["started"])
+        self.assertEqual(Ledger(self.path).history()["operations"], [])
+
+    def test_uah_start_rejects_insufficient_crypto_depth_atomically(self):
+        def thin_crypto(endpoint):
+            data = feed(endpoint)
+            if endpoint.startswith("orderbook/BTC_USDT"):
+                data["asks"] = [["100", "0.01"]]
+            return data
+
+        ledger = Ledger(self.path, thin_crypto)
+        before = ledger.state()
+        with self.assertRaisesRegex(MarketUnavailable, "Insufficient crypto ask depth"):
+            ledger.start()
+        self.assertEqual(Ledger(self.path, thin_crypto).state(), before)
 
     def test_record_valuation_is_idempotent_and_history_is_read_only(self):
         ledger = Ledger(self.path, feed)

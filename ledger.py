@@ -75,17 +75,74 @@ def sold_basis(basis, units, available, quantum):
 
 
 def buy_levels(levels, budget, step, price_step):
+    target = floor_step(budget / levels[0][0], step)
+    remaining = target
     fills = []
     for price, size in levels:
         if price % price_step:
             raise ValueError("Ask does not match price precision")
-        quantity = floor_step(min(size, budget / price), step)
+        quantity = min(floor_step(size, step), remaining)
         if quantity:
             fills.append((price, quantity))
-            budget -= price * quantity
-        if budget < price * step:
+            remaining -= quantity
+        if not remaining:
             break
+    if remaining:
+        raise MarketUnavailable("Insufficient crypto ask depth for the target quantity")
+    if sum((price * quantity for price, quantity in fills), ZERO) > budget:
+        raise MarketUnavailable("Target quantity exceeds the USDT budget at executable prices")
     return fills
+
+
+def buy_with_fx_depth(asks, budget, amount_step, price_step, levels, fx_fee, fx_step):
+    if not levels:
+        raise MarketUnavailable("Insufficient USDT/UAH ask depth")
+    remaining = budget
+    affordable = ZERO
+    for rate, available in levels:
+        if rate % fx_step:
+            raise ValueError("FX ask does not match market precision")
+        units = min(available, remaining / rate)
+        affordable += units
+        remaining -= units * rate
+        if units < available:
+            break
+    else:
+        # Probe the next affordable lot at the last visible price. Actual
+        # fills below must be covered entirely by visible FX depth.
+        affordable += remaining / levels[-1][0]
+    fills = buy_levels(asks, affordable * (1 - fx_fee), amount_step, price_step)
+    received = sum((price * units for price, units in fills), ZERO)
+    acquired = received / (1 - fx_fee)
+    remaining = acquired
+    fx_fills = []
+    cost = ZERO
+    for rate, available in levels:
+        units = min(available, remaining)
+        if not units:
+            break
+        fx_fills.append((rate, units))
+        cost += rate * units
+        remaining -= units
+    if remaining:
+        raise MarketUnavailable("Insufficient USDT/UAH ask depth")
+    return fills, dict(requested=received, received=received, acquired=acquired,
+                      fee=acquired - received, cost_uah=cost, debit_uah=cost,
+                      fills=fx_fills, worst_price=fx_fills[-1][0] if fx_fills else levels[0][0])
+
+
+def consume_quote_depth(levels, fills):
+    available = [amount for _, amount in levels]
+    for _, filled in fills:
+        for index, amount in enumerate(available):
+            consumed = min(amount, filled)
+            available[index] -= consumed
+            filled -= consumed
+            if filled == 0:
+                break
+        if filled:
+            raise MarketUnavailable("FX ask depth changed during simulated purchases")
+    levels[:] = [(price, amount) for (price, _), amount in zip(levels, available) if amount]
 
 
 def exact_json(data):
@@ -290,7 +347,7 @@ class Ledger:
         return max(published, self.fee_override or ZERO) / 100
 
     def book(self, pair):
-        endpoint = f"orderbook/{pair}?limit={1 if pair == FX else 50}"
+        endpoint = f"orderbook/{pair}?limit=50"
         try:
             book = self.fetch(endpoint)
             stamp = int(book["timestamp"])
@@ -304,7 +361,7 @@ class Ledger:
                     or not (bid <= ask) or any(price <= 0 or size <= 0 for price, size in asks + bids)):
                 raise ValueError("Invalid or stale book")
             return dict(ask=ask, ask_size=ask_size, bid=bid, bid_size=bid_size,
-                        **(dict(asks=asks, bids=bids) if pair != FX else {}),
+                        asks=asks, bids=bids,
                         timestamp=stamp, received_at=now().isoformat(),
                         source=f"https://whitebit.com/api/v4/public/{endpoint}")
         except (OSError, HTTPException, ValueError, InvalidOperation, TypeError,
@@ -332,14 +389,17 @@ class Ledger:
             fx_fee = self.fee(fx_market)
         except (KeyError, ValueError, InvalidOperation) as error:
             raise MarketUnavailable("USDT/UAH fee unavailable") from error
-        fx_cost = fx["ask"] / (1 - fx_fee)
+        fx_step = max(Decimal(1).scaleb(-int(fx_market["moneyPrec"])),
+                      number(fx_market.get("tickSize") or "0"))
+        fx_remaining = list(fx["asks"])
         operations = []
         skipped = {}
-        fx_used = ZERO
         for position in plan["positions"]:
             symbol = position["symbol"]
             pair = f"{symbol}_USDT"
             budget = min(cash, Decimal(position["allocation_minor"]) / 100)
+            if not position["allocation_minor"]:
+                continue
             try:
                 market = markets[pair]
                 book = self.book(pair)
@@ -348,24 +408,26 @@ class Ledger:
                 price_step = Decimal(1).scaleb(-int(market["moneyPrec"]))
                 amount_step = max(amount_step, number(market.get("stepSize") or "0"))
                 price_step = max(price_step, number(market.get("tickSize") or "0"))
-                fills = buy_levels(book["asks"], budget / fx_cost, amount_step, price_step)
-                quantity = sum((units for _, units in fills), ZERO)
+                fills, conversion = buy_with_fx_depth(
+                    book["asks"], budget, amount_step, price_step, fx_remaining, fx_fee, fx_step
+                )
                 total = sum((price * units for price, units in fills), ZERO)
+                quote_left = conversion["received"] - total
+                quantity = sum((units for _, units in fills), ZERO)
                 max_total = number(market["maxTotal"])
                 if (quantity <= 0 or quantity < number(market["minAmount"])
                         or total < number(market["minTotal"]) or (max_total and total > max_total)):
                     raise ValueError("Order is outside market size limits")
-                fx_gross = total / (1 - fx_fee)
-                if fx_used + fx_gross > fx["ask_size"]:
-                    raise ValueError("Insufficient liquidity at USDT/UAH best ask")
-                debit = (fx_gross * fx["ask"]).quantize(CENT, rounding=ROUND_UP)
-                if debit > budget:
+                debit = conversion["debit_uah"].quantize(CENT, rounding=ROUND_UP)
+                if debit > budget or quote_left < 0:
                     raise ValueError("Debit exceeds allocation")
             except (MarketUnavailable, KeyError, ValueError, InvalidOperation, OverflowError) as error:
+                if pair in markets:
+                    raise MarketUnavailable(str(error)) from error
                 skipped[symbol] = str(error)
                 continue
-            fx_used += fx_gross
             cash -= debit
+            consume_quote_depth(fx_remaining, conversion["fills"])
             base_fee = quantity * fee
             operations.append(dict(
                 time=now().isoformat(), side="buy", symbol=symbol, pair=pair, price=total / quantity,
@@ -373,8 +435,12 @@ class Ledger:
                 gross_quantity=quantity, quantity=quantity - base_fee, fee_base=base_fee,
                 fee_rate=fee, fee_asset=symbol, published_fee_percent=market["takerFee"],
                 total_usdt=total, debit_uah=debit, cash_after_uah=cash,
-                fx_fee_usdt=fx_gross - total, fx_gross_usdt=fx_gross,
-                fx_rounding_uah=debit - fx_gross * fx["ask"],
+                fx_requested_usdt=conversion["requested"], fx_acquired_usdt=conversion["acquired"],
+                fx_fee_usdt=conversion["fee"], fx_received_usdt=conversion["received"],
+                fx_cost_uah=conversion["cost_uah"], fx_gross_uah=conversion["debit_uah"],
+                fx_fills=[dict(price=price, quantity=units) for price, units in conversion["fills"]],
+                fx_worst_price=conversion["worst_price"], unused_usdt=quote_left,
+                fx_rounding_uah=debit - conversion["debit_uah"],
                 quote_timestamp=book["timestamp"], quote_received_at=book["received_at"],
                 source=book["source"],
             ))
@@ -415,13 +481,15 @@ class Ledger:
                 raise MarketUnavailable("USDT/UAH spot market unavailable")
             fx = self.book(FX)
             fx_fee = self.fee(fx_market)
-            fx_cost = fx["ask"] / (1 - fx_fee)
-        else:
-            fx_cost = Decimal(1)
+            fx_step = max(Decimal(1).scaleb(-int(fx_market["moneyPrec"])),
+                          number(fx_market.get("tickSize") or "0"))
+            fx_remaining = list(fx["asks"])
         operations = []
         for position in plan["positions"]:
             symbol = position["symbol"]
             pair = f"{symbol}_USDT"
+            if not position["allocation_minor"]:
+                continue
             try:
                 market = markets[pair]
                 book = self.book(pair)
@@ -430,21 +498,35 @@ class Ledger:
                 price_step = max(Decimal(1).scaleb(-int(market["moneyPrec"])), number(market.get("tickSize") or "0"))
                 allocation = Decimal(position["allocation_minor"]) / (Decimal(10) ** scale)
                 budget = min(cash, allocation)
-                fills = buy_levels(book["asks"], budget / fx_cost, amount_step, price_step)
+                conversion = None
+                if fx is not None:
+                    fills, conversion = buy_with_fx_depth(
+                        book["asks"], budget, amount_step, price_step, fx_remaining, fx_fee, fx_step
+                    )
+                    total = sum((price * units for price, units in fills), ZERO)
+                    quote_left = conversion["received"] - total
+                else:
+                    fills = buy_levels(book["asks"], budget, amount_step, price_step)
+                    total = sum((price * units for price, units in fills), ZERO)
+                    quote_left = budget - total
                 quantity = sum((units for _, units in fills), ZERO)
-                total = sum((price * units for price, units in fills), ZERO)
                 if (quantity <= 0 or quantity < number(market["minAmount"])
-                        or total < number(market["minTotal"])):
+                        or total < number(market["minTotal"])
+                        or (number(market["maxTotal"]) and total > number(market["maxTotal"]))):
                     raise ValueError("Order is outside market size limits")
                 if currency == "UAH":
-                    debit = (total * fx_cost).quantize(CENT, rounding=ROUND_UP)
+                    debit = conversion["debit_uah"].quantize(CENT, rounding=ROUND_UP)
                 else:
                     debit = total.quantize(Decimal("0.000001"), rounding=ROUND_UP)
                 if debit > budget:
                     raise ValueError("Debit exceeds allocation")
             except (KeyError, MarketUnavailable, ValueError, InvalidOperation, OverflowError) as error:
+                if pair in markets:
+                    raise MarketUnavailable(str(error)) from error
                 continue
             cash -= debit
+            if conversion is not None:
+                consume_quote_depth(fx_remaining, conversion["fills"])
             base_fee = quantity * fee
             operation = dict(time=now().isoformat(), side="buy", symbol=symbol, pair=pair,
                              price=total / quantity, fills=[dict(price=p, quantity=q) for p, q in fills],
@@ -453,6 +535,15 @@ class Ledger:
                              cash_after=(cash), quote_timestamp=book["timestamp"],
                              quote_received_at=book["received_at"], source=book["source"])
             operation["debit_uah" if currency == "UAH" else "debit_usdt"] = debit
+            if conversion is not None:
+                operation.update(fx_requested_usdt=conversion["requested"],
+                                 fx_acquired_usdt=conversion["acquired"],
+                                 fx_fee_usdt=conversion["fee"],
+                                 fx_received_usdt=conversion["received"],
+                                 fx_cost_uah=conversion["cost_uah"],
+                                 fx_gross_uah=conversion["debit_uah"],
+                                 fx_fills=[dict(price=p, quantity=q) for p, q in conversion["fills"]],
+                                 fx_worst_price=conversion["worst_price"], unused_usdt=quote_left)
             operations.append(operation)
         if not operations:
             raise MarketUnavailable("No eligible purchases")
@@ -466,6 +557,9 @@ class Ledger:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM paper_start WHERE portfolio_id = ?", (self.portfolio_id,)).fetchone():
                 return self.history()
+            if (fx is not None and not fresh(fx["timestamp"])) or any(
+                    not fresh(op["quote_timestamp"]) for op in operations):
+                raise MarketUnavailable("Quotes expired before saving")
             db.execute("INSERT INTO paper_start (portfolio_id, snapshot) VALUES (?, ?)",
                        (self.portfolio_id, exact_json(snapshot)))
             db.executemany("INSERT INTO paper_operations (portfolio_id, operation) VALUES (?, ?)",
