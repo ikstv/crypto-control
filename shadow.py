@@ -17,6 +17,27 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS shadow_log (
 )"""
 
 
+def daily_record(end, fetch):
+    start = end - 31 * DAY
+    try:
+        rows = fetch(start, end)
+        # Never allow the in-progress UTC bucket into either moving average.
+        rows = [row for row in rows if not (
+            isinstance(row, list) and row and type(row[0]) is int and row[0] >= end)]
+        closes = [c.close for c in validate(rows, start, end)]
+        decision, fast, slow = crossover(closes)
+        reason = {"BUY": "SMA10 crossed above SMA30",
+                  "SELL": "SMA10 crossed below SMA30",
+                  "HOLD": "No SMA10/SMA30 crossover"}[decision]
+        record = ("signal", decision, str(closes[-1]), str(fast), str(slow), reason)
+    except (OSError, HTTPException):
+        record = ("skip", None, None, None, None, "WhiteBIT candles unavailable")
+    except (ValueError, TypeError) as error:
+        record = ("skip", None, None, None, None, str(error))
+
+    return record
+
+
 class Shadow:
     def __init__(self, algorithm):
         self.algorithm = algorithm
@@ -33,22 +54,7 @@ class Shadow:
         if self.algorithm.status() != "active":
             return
         end = int(time.time() if timestamp is None else timestamp) // DAY * DAY
-        start = end - 31 * DAY
-        try:
-            rows = fetch(start, end)
-            # Never allow the in-progress UTC bucket into either moving average.
-            rows = [row for row in rows if not (
-                isinstance(row, list) and row and type(row[0]) is int and row[0] >= end)]
-            closes = [c.close for c in validate(rows, start, end)]
-            decision, fast, slow = crossover(closes)
-            reason = {"BUY": "SMA10 crossed above SMA30",
-                      "SELL": "SMA10 crossed below SMA30",
-                      "HOLD": "No SMA10/SMA30 crossover"}[decision]
-            record = ("signal", decision, str(closes[-1]), str(fast), str(slow), reason)
-        except (OSError, HTTPException):
-            record = ("skip", None, None, None, None, "WhiteBIT candles unavailable")
-        except (ValueError, TypeError) as error:
-            record = ("skip", None, None, None, None, str(error))
+        record = daily_record(end, fetch)
 
         def save(db):
             db.execute(SCHEMA)
