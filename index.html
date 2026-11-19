@@ -117,15 +117,31 @@
     update();
     async function refreshShadow() {
       const status = document.querySelector("#shadow-status");
+      const format = value => Number(value).toLocaleString("uk-UA", {maximumFractionDigits: 2});
       try {
         const response = await fetch("/api/v1/shadow/signals", {cache: "no-store"});
         if (!response.ok) throw new Error();
         const {mode, records} = await response.json();
         const latest = records[0];
-        const day = latest && new Date(latest.candle_open * 1000).toISOString().slice(0, 10);
-        status.textContent = labels[mode] + ". " + (latest
-          ? day + " UTC · " + (latest.decision ?? "Пропущено") + " · " + latest.reason
-          : "Журнал сигналів порожній.");
+        if (!latest) {
+          status.textContent = labels[mode] + ". Журнал сигналів порожній.";
+          return;
+        }
+        const closeTime = (latest.candle_open + 86400) * 1000;
+        const closed = new Date(closeTime).toISOString().slice(0, 16).replace("T", " ");
+        const stale = closeTime < Math.floor(Date.now() / 86400000) * 86400000;
+        const reasons = {
+          "SMA10 crossed above SMA30": "SMA 10 перетнула SMA 30 знизу вгору",
+          "SMA10 crossed below SMA30": "SMA 10 перетнула SMA 30 згори вниз",
+          "No SMA10/SMA30 crossover": "Перетину SMA 10 і SMA 30 немає"
+        };
+        status.textContent = labels[mode] + ". " +
+          (stale ? "Застарілий запис. " : mode !== "active" ? "Архівний запис. " : "") +
+          "Закриття свічки " + closed + " UTC · " +
+          (latest.decision ?? "Аналіз пропущено") + " · " +
+          (reasons[latest.reason] ?? latest.reason) +
+          (latest.decision ? " · Ціна " + format(latest.close) + " USDT · SMA 10 " +
+            format(latest.sma10) + " · SMA 30 " + format(latest.sma30) : "");
       } catch {
         status.textContent = "Журнал сигналів недоступний.";
       }
