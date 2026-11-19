@@ -11,7 +11,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from ledger import Ledger
-from portfolio import read_portfolio
+from portfolio import existing_portfolio_ids, ledger_schema_migrated, read_portfolio
 
 ROOT = Path(__file__).resolve().parent
 DATABASE = ROOT / "data" / "crypto_control.sqlite3"
@@ -27,7 +27,9 @@ def content_digest(db):
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_schema WHERE type='table'")}
     if not {"settings", "positions", "history"}.issubset(tables):
         raise ValueError("Expected a Crypto Control portfolio database")
-    if db.execute("SELECT capital_minor FROM settings WHERE id = 1").fetchone() is None:
+    columns = {row[1] for row in db.execute("PRAGMA table_info(settings)")}
+    key = "portfolio_id" if "portfolio_id" in columns else "id"
+    if db.execute(f"SELECT capital_minor FROM settings WHERE {key} = 1").fetchone() is None:
         raise ValueError("Missing initial portfolio settings")
     digest = hashlib.sha256()
     for pragma in ("application_id", "user_version"):
@@ -89,24 +91,33 @@ def restore_backup(backup, destination):
     copy_snapshot(backup, destination, expected)
 
 
+def portfolio_summary(path, portfolio_id=None):
+    plan = read_portfolio(path, portfolio_id)
+    state = Ledger(path, portfolio_id=portfolio_id or 1).history()
+    currency = plan.get("currency", "UAH").lower()
+    return {
+        "initial_capital_minor": plan["initial_capital_minor"],
+        "operations": len(state["operations"]),
+        f"cash_{currency}": state[f"cash_{currency}"],
+        "holdings": {row["symbol"]: row["quantity"] for row in state["holdings"]},
+        f"realized_pnl_{currency}": state[f"realized_pnl_{currency}"],
+    }
+
+
 def verify_backup(backup):
     with TemporaryDirectory(prefix="crypto-control-restore-") as temp:
         restored = Path(temp) / "restored.sqlite3"
         restore_backup(backup, restored)
         # Older portfolios can be initialized by Ledger.history(); do this only on the test copy.
-        plan = read_portfolio(restored)
-        state = Ledger(restored).history()
+        migrated = ledger_schema_migrated(restored)
         with closing(sqlite3.connect(restored)) as db:
             events = db.execute("SELECT COUNT(*) FROM history").fetchone()[0]
-        return {
-            "integrity": "ok",
-            "initial_capital_minor": plan["initial_capital_minor"],
-            "history_events": events,
-            "operations": len(state["operations"]),
-            "cash_uah": state["cash_uah"],
-            "holdings": {row["symbol"]: row["quantity"] for row in state["holdings"]},
-            "realized_pnl_uah": state["realized_pnl_uah"],
-        }
+        result = dict(integrity="ok", history_events=events,
+                      **portfolio_summary(restored, 1 if migrated else None))
+        if migrated:
+            result["portfolios"] = {str(key): portfolio_summary(restored, key)
+                                    for key in existing_portfolio_ids(restored)}
+        return result
 
 
 def main():
