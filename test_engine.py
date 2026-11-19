@@ -90,6 +90,7 @@ class EngineTests(unittest.TestCase):
         self.stop(first)
         with self.assertRaises(OSError):
             urlopen(f"http://127.0.0.1:{self.port}/api/v1/status", timeout=1)
+        (self.root / "data" / "engine-stopped").unlink()
         restarted = self.start()
         self.assertEqual(self.wait_status(restarted)["status"], "ready")
         self.stop(restarted)
