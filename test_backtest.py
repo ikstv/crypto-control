@@ -12,6 +12,15 @@ def candles(prices):
 
 
 class BacktestTests(TestCase):
+    def test_equal_averages_do_not_exit_and_final_signal_cannot_fill(self):
+        prices = [(100, 100), (100, 90), (90, 110), (200, 110), (50, 90)]
+        result = simulate(candles(prices), D(1000), Costs(D(0), D(0), D(0)),
+                          "ma", fast=1, slow=2)
+        self.assertEqual(result["balance"], D(450))
+        result = simulate(candles(prices[:3]), D(1000), Costs(D(0), D(0), D(0)),
+                          "ma", fast=1, slow=2)
+        self.assertEqual(result["trades"], 0)
+
     def test_fees_are_charged_on_both_sides(self):
         result = simulate(candles([(100, 100), (100, 100)]), D(1000),
                           Costs(D(1), D(0), D(0)), "hold")

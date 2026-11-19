@@ -6,7 +6,7 @@ from contextlib import closing
 from http.client import HTTPException
 
 from algorithm import Blocked
-from backtest import DAY, SOURCE, fetch_candles, validate
+from backtest import DAY, SOURCE, crossover, fetch_candles, validate
 
 CONFIG = "WhiteBIT:BTC_USDT:1d:SMA10/30:v1"
 SCHEMA = """CREATE TABLE IF NOT EXISTS shadow_log (
@@ -40,14 +40,10 @@ class Shadow:
             rows = [row for row in rows if not (
                 isinstance(row, list) and row and type(row[0]) is int and row[0] >= end)]
             closes = [c.close for c in validate(rows, start, end)]
-            fast_before, slow_before = sum(closes[-11:-1]) / 10, sum(closes[:-1]) / 30
-            fast, slow = sum(closes[-10:]) / 10, sum(closes[-30:]) / 30
-            if fast_before <= slow_before and fast > slow:
-                decision, reason = "BUY", "SMA10 crossed above SMA30"
-            elif fast_before >= slow_before and fast < slow:
-                decision, reason = "SELL", "SMA10 crossed below SMA30"
-            else:
-                decision, reason = "HOLD", "No SMA10/SMA30 crossover"
+            decision, fast, slow = crossover(closes)
+            reason = {"BUY": "SMA10 crossed above SMA30",
+                      "SELL": "SMA10 crossed below SMA30",
+                      "HOLD": "No SMA10/SMA30 crossover"}[decision]
             record = ("signal", decision, str(closes[-1]), str(fast), str(slow), reason)
         except (OSError, HTTPException):
             record = ("skip", None, None, None, None, "WhiteBIT candles unavailable")

@@ -117,22 +117,31 @@ def load_candles(path, start, end, fetch=fetch_candles):
     return candles
 
 
+def crossover(closes, fast=10, slow=30):
+    previous = sum(closes[-fast-1:-1]) / fast - sum(closes[-slow-1:-1]) / slow
+    short, long = sum(closes[-fast:]) / fast, sum(closes[-slow:]) / slow
+    decision = "BUY" if previous <= 0 and short > long else (
+        "SELL" if previous >= 0 and short < long else "HOLD")
+    return decision, short, long
+
+
 def simulate(candles, capital, costs, strategy, *, fast=10, slow=30, tp=D(2), sl=D(1)):
     if (not candles or not capital.is_finite() or capital <= 0 or not 0 < fast < slow
             or not tp.is_finite() or not sl.is_finite() or not 0 < sl < 100 or tp <= 0
-            or strategy not in {"hold", "ma", "tp_sl"}):
+            or strategy not in {"hold", "ma", "tp_sl", "cash"}):
         raise ValueError("Invalid simulation parameters")
     fee, impact = costs.rates()
     cash, units, entry, basis = capital, D(0), D(0), D(0)
     peak, drawdown = capital, D(0)
     trades = wins = 0
-    pending = "buy" if strategy != "ma" else None
+    pending = "buy" if strategy in {"hold", "tp_sl"} else None
     closes = []
-    previous_above = None
+    execution_cost = D(0)
 
     def sell(price):
-        nonlocal cash, units, trades, wins
+        nonlocal cash, units, trades, wins, execution_cost
         cash = units * price * (1 - impact) * (1 - fee)
+        execution_cost += units * price - cash
         units = D(0)
         trades += 1
         wins += int(cash > basis)
@@ -142,6 +151,7 @@ def simulate(candles, capital, costs, strategy, *, fast=10, slow=30, tp=D(2), sl
             entry = candle.open * (1 + impact)
             basis = cash
             units = cash / entry * (1 - fee)
+            execution_cost += cash - units * candle.open
             cash = D(0)
         elif pending == "sell":
             sell(candle.open)
@@ -155,19 +165,19 @@ def simulate(candles, capital, costs, strategy, *, fast=10, slow=30, tp=D(2), sl
         drawdown = max(drawdown, (peak - equity) / peak * 100)
 
         closes.append(candle.close)
-        if strategy == "ma" and len(closes) >= slow:
-            above = sum(closes[-fast:]) / fast > sum(closes[-slow:]) / slow
-            if above and previous_above is False and not units:
+        if strategy == "ma" and len(closes) > slow:
+            decision, _, _ = crossover(closes, fast, slow)
+            if decision == "BUY" and not units:
                 pending = "buy"
-            elif not above and previous_above is True and units:
+            elif decision == "SELL" and units:
                 pending = "sell"
-            previous_above = above
         elif strategy == "tp_sl":
             if not units:
                 pending = "buy"
             elif candle.close >= entry * (1 + tp / 100) or candle.close <= entry * (1 - sl / 100):
                 pending = "sell"
     return dict(balance=cash, return_percent=(cash / capital - 1) * 100,
+                execution_cost_usdt=execution_cost,
                 drawdown_percent=drawdown, trades=trades,
                 win_percent=D(wins) / trades * 100 if trades else None)
 
