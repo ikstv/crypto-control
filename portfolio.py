@@ -180,6 +180,10 @@ def create_portfolio(path, name, currency, initial_capital, idempotency_key, mig
             (name, currency, initial_capital_minor, scale, idempotency_key, created_at)
             VALUES (?, ?, ?, ?, ?, ?)""",
             (name.strip(), currency, minor, scale, idempotency_key, datetime.now(timezone.utc).isoformat()))
+        columns = {row[1] for row in db.execute("PRAGMA table_info(settings)")}
+        if "portfolio_id" in columns:
+            db.execute("INSERT INTO settings (portfolio_id, capital_minor) VALUES (?, ?)",
+                       (cursor.lastrowid, minor))
         return {"id": cursor.lastrowid, "name": name.strip(), "currency": currency,
                 "initial_capital_minor": minor, "scale": scale}
 

@@ -19,6 +19,19 @@
 <main>
   <h1>Crypto Control</h1>
   <p>Демонстраційний портфель</p>
+  <section aria-labelledby="portfolio-manager-heading">
+    <h2 id="portfolio-manager-heading">Портфелі</h2>
+    <label>Вибраний портфель
+      <select id="portfolio-selector" disabled><option>Legacy-портфель</option></select>
+    </label>
+    <p id="portfolio-manager-status" role="status">Перевірка схеми портфелів…</p>
+    <form id="portfolio-create" hidden>
+      <input name="name" placeholder="Назва" maxlength="100" required>
+      <select name="currency"><option value="UAH">UAH</option><option value="USDT">USDT</option></select>
+      <input name="initial_capital" type="number" min="0.000001" step="0.000001" placeholder="Початковий капітал" required>
+      <button type="submit">Створити портфель</button>
+    </form>
+  </section>
   <section>
     <h2>Віртуальна торгівля</h2>
     <button id="paper-start" type="button" disabled>Почати віртуальну торгівлю</button>
@@ -84,6 +97,50 @@
     <p id="shadow-status" role="status"></p>
   </section>
 </main>
+<script>
+  (() => {
+    const selector = document.querySelector("#portfolio-selector");
+    const form = document.querySelector("#portfolio-create");
+    const status = document.querySelector("#portfolio-manager-status");
+    let records = [];
+    async function loadPortfolios() {
+      try {
+        const response = await fetch("/api/v1/portfolios", {cache: "no-store"});
+        if (response.status === 409) {
+          status.textContent = "Для створення додаткових портфелів потрібна контрольована міграція SQLite.";
+          return;
+        }
+        if (!response.ok) throw new Error();
+        records = (await response.json()).portfolios;
+        selector.replaceChildren(...records.map(item => new Option(`${item.name} · ${item.currency} · #${item.id}`, item.id)));
+        selector.disabled = false;
+        form.hidden = false;
+        status.textContent = "Портфель вибирається лише для перегляду й підтверджених дій.";
+      } catch { status.textContent = "Менеджер портфелів недоступний."; }
+    }
+    selector.addEventListener("change", () => {
+      const item = records.find(row => String(row.id) === selector.value);
+      if (item) status.textContent = `${item.name} · ${item.currency} · початковий капітал ${item.initial_capital_minor / 10 ** item.scale}`;
+    });
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      const button = form.querySelector("button");
+      button.disabled = true;
+      const data = Object.fromEntries(new FormData(form));
+      data.idempotency_key = crypto.randomUUID();
+      try {
+        const response = await fetch("/api/v1/portfolios", {method: "POST", headers: {"Content-Type": "application/json", "X-Crypto-Control": "paper-start"}, body: JSON.stringify(data)});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Не вдалося створити портфель");
+        status.textContent = `Створено ${result.name} · ${result.currency}. Інші портфелі не змінено.`;
+        form.reset();
+        await loadPortfolios();
+      } catch (error) { status.textContent = error.message; }
+      finally { button.disabled = false; }
+    });
+    loadPortfolios();
+  })();
+</script>
 <script>
   (() => {
     const url = "/api/v1/algorithm";
