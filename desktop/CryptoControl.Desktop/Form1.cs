@@ -5,15 +5,23 @@ using Microsoft.Web.WebView2.WinForms;
 
 public partial class Form1 : Form
 {
-    private const string EngineUrl = "http://127.0.0.1:8000/";
+    private readonly Uri engineUrl;
+    private readonly string dataPath;
+    private readonly bool isolated;
     private readonly WebView2 browser = new();
     private readonly Label status = new();
     private readonly Button retry = new();
 
-    public Form1()
+    public Form1(int? testPort = null)
     {
+        isolated = testPort.HasValue;
+        engineUrl = new Uri($"http://127.0.0.1:{testPort ?? 8000}/");
+        dataPath = isolated
+            ? Path.Combine(Path.GetTempPath(), "CryptoControl-Test", Guid.NewGuid().ToString("N"))
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "CryptoControl", "WebView2");
         InitializeComponent();
-        Text = "Crypto Control Desktop";
+        Text = isolated ? $"Crypto Control Desktop · тестовий порт {testPort}" : "Crypto Control Desktop";
         Icon = SystemIcons.Application;
         browser.Dock = DockStyle.Fill;
         status.Dock = DockStyle.Top;
@@ -29,7 +37,8 @@ public partial class Form1 : Form
             if (!Uri.TryCreate(args.Uri, UriKind.Absolute, out var uri)
                 || uri.Scheme != Uri.UriSchemeHttp
                 || uri.Host != "127.0.0.1"
-                || uri.Port != 8000)
+                || uri.Port != engineUrl.Port
+                || uri.UserInfo.Length != 0)
             {
                 args.Cancel = true;
             }
@@ -44,25 +53,41 @@ public partial class Form1 : Form
     {
         retry.Visible = false;
         status.Text = "Підключення до Crypto Control Engine…";
-        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+        using var handler = new HttpClientHandler { AllowAutoRedirect = false, UseProxy = false };
+        using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(2) };
         try
         {
-            using var response = await client.GetAsync("http://127.0.0.1:8000/api/v1/status");
+            using var response = await client.GetAsync(new Uri(engineUrl, "api/v1/status"));
             response.EnsureSuccessStatusCode();
             status.Text = "Crypto Control Engine підключено";
-            var dataPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "CryptoControl", "WebView2");
             Directory.CreateDirectory(dataPath);
-            await browser.EnsureCoreWebView2Async(
-                await CoreWebView2Environment.CreateAsync(null, dataPath));
-            browser.CoreWebView2.Settings.AreDevToolsEnabled = false;
-            browser.CoreWebView2.Navigate(EngineUrl);
+            var core = browser.CoreWebView2;
+            if (core is null)
+            {
+                await browser.EnsureCoreWebView2Async(
+                    await CoreWebView2Environment.CreateAsync(null, dataPath));
+                core = browser.CoreWebView2 ?? throw new InvalidOperationException("WebView2 initialization failed.");
+                var environment = core.Environment;
+                core.NewWindowRequested += (_, args) => args.Handled = true;
+                core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
+                core.WebResourceRequested += (_, args) =>
+                {
+                    if (!Uri.TryCreate(args.Request.Uri, UriKind.Absolute, out var uri)
+                        || uri.Scheme != engineUrl.Scheme || uri.Host != engineUrl.Host
+                        || uri.Port != engineUrl.Port || uri.UserInfo.Length != 0)
+                        args.Response = environment.CreateWebResourceResponse(
+                            null, 403, "Blocked", "");
+                };
+            }
+            core.Settings.AreDevToolsEnabled = false;
+            core.Navigate(engineUrl.AbsoluteUri);
         }
         catch (Exception error) when (error is HttpRequestException or TaskCanceledException
                                       or WebView2RuntimeNotFoundException)
         {
-            status.Text = "Фонове ядро недоступне. Запустіть його та повторіть підключення.";
+            status.Text = isolated
+                ? $"Тестове ядро на порту {engineUrl.Port} недоступне."
+                : "Фонове ядро недоступне. Запустіть його та повторіть підключення.";
             retry.Visible = true;
         }
     }
