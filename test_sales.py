@@ -4,11 +4,67 @@ from pathlib import Path
 from unittest import TestCase
 
 from ledger import Ledger, MarketUnavailable, OperationConflict
-from portfolio import initialize
+from portfolio import initialize, migrate_ledger_schema
 from test_ledger import feed
 
 
 class SaleTests(TestCase):
+    def test_multilevel_fx_bid_books_fees_and_pnl_in_both_schemas(self):
+        for migrated in (False, True):
+            with self.subTest(migrated=migrated):
+                path = self.path.with_name(f"deep-{migrated}.sqlite3")
+                initialize(path)
+                if migrated:
+                    migrate_ledger_schema(path)
+
+                def depth(endpoint):
+                    book = feed(endpoint)
+                    if "USDT_UAH" in endpoint:
+                        book["bids"] = [["40", "5"], ["39", "100"]]
+                    return book
+
+                ledger = Ledger(path, depth)
+                before = ledger.start()
+                preview = ledger.preview("BTC")
+                receipt = ledger.sell("BTC", "deep-fx", preview["fingerprint"])
+                sale, = receipt["sales"]
+                net = Decimal("0.2494") * 99 * Decimal(".999")
+                gross = 200 + (net - 5) * 39
+                credit_key = "net_currency" if migrated else "net_uah"
+                pnl_key = "realized_pnl" if migrated else "realized_pnl_uah"
+                self.assertEqual(Decimal(sale["net_usdt"]), net)
+                self.assertEqual(Decimal(sale["fx_fee_uah"]), gross * Decimal(".001"))
+                self.assertEqual(Decimal(sale[credit_key]), Decimal("966.00"))
+                reopened = Ledger(path, depth)
+                self.assertEqual(reopened.sell("BTC", "deep-fx", "ignored"), receipt)
+                history = reopened.history()
+                self.assertEqual(Decimal(history["cash_uah"]), Decimal(before["cash_uah"]) + Decimal("966.00"))
+                self.assertEqual(Decimal(history["realized_pnl_uah"]), Decimal(sale[pnl_key]))
+
+    def test_uah_sale_requires_full_fx_depth_in_both_schemas(self):
+        for migrated in (False, True):
+            with self.subTest(migrated=migrated):
+                path = self.path.with_name(f"fx-{migrated}.sqlite3")
+                initialize(path)
+                if migrated:
+                    migrate_ledger_schema(path)
+                ledger = Ledger(path, feed)
+                ledger.start()
+                before = ledger.history()
+                def thin_fx(endpoint):
+                    book = feed(endpoint)
+                    if "USDT_UAH" in endpoint:
+                        book["bids"] = [["40", "5"]]
+                    return book
+
+                ledger.fetch = thin_fx
+                # Confirm against current terms, so fingerprint mismatch cannot
+                # hide a sale that incorrectly fits itself to FX depth.
+                with self.assertRaises(MarketUnavailable):
+                    preview = ledger.preview("BTC")
+                    ledger.sell("BTC", "thin-fx", preview["fingerprint"])
+                self.assertEqual(Ledger(path, feed).history(), before)
+
     def setUp(self):
         temp = TemporaryDirectory()
         self.addCleanup(temp.cleanup)

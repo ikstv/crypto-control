@@ -55,16 +55,38 @@ def floor_step(value, step):
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
-def sale_proceeds(units, bid, fee_rate, fx):
+class InsufficientFxDepth(MarketUnavailable):
+    pass
+
+
+def convert_sale_usdt(bids, net, fee_rate, used):
+    gross = ZERO
+    remaining = net
+    for raw_price, raw_size in bids:
+        price, size = number(raw_price), number(raw_size)
+        skipped = min(used, size)
+        used -= skipped
+        fill = min(size - skipped, remaining)
+        gross += price * fill
+        remaining -= fill
+        if not remaining:
+            break
+    if remaining:
+        raise InsufficientFxDepth("Insufficient USDT/UAH bid depth")
+    fee = gross * fee_rate
+    return (gross - fee).quantize(CENT, rounding=ROUND_DOWN), fee
+
+
+def sale_proceeds(units, bid, fee_rate, fx, used=ZERO):
     gross = units * bid
     fee = gross * fee_rate
     net = gross - fee
     if fx is None:
         credit = net.quantize(USDT_UNIT, rounding=ROUND_DOWN)
+        fx_fee = ZERO
     else:
-        converted = net * number(fx["bid"])
-        credit = (converted - converted * number(fx["fee_rate"])).quantize(CENT, rounding=ROUND_DOWN)
-    return fee, net, credit
+        credit, fx_fee = convert_sale_usdt(fx["bids"], net, number(fx["fee_rate"]), used)
+    return fee, net, credit, fx_fee
 
 
 def sold_basis(basis, units, available, quantum):
@@ -640,7 +662,7 @@ class Ledger:
         for holding in journal["holdings"]:
             pair = holding["pair"]
             book = self.book(pair)
-            sale = self.sale_quote(holding, markets[pair], book, fx, fx_fee, fx["bid_size"] - net)
+            sale = self.sale_quote(holding, markets[pair], book, fx, fx_fee, net)
             gross += sale["available_quantity"] * book["bid"]
             net += sale["net_usdt"]
             details.append(sale)
@@ -650,7 +672,7 @@ class Ledger:
 
     def totals(self, journal, cash, gross, net, fx, fx_fee, details):
         rate = fx["bid"] if fx else ZERO
-        uah_fee = net * rate * fx_fee
+        uah_fee = sum((row["fx_fee_uah"] for row in details), ZERO)
         gross_uah = cash + gross * rate
         net_uah = cash + sum((row["net_uah"] for row in details), ZERO)
         initial = number(journal["initial_uah"])
@@ -731,17 +753,19 @@ class Ledger:
         try:
             fx_fee = self.fee(markets[FX])
             fx = self.book(FX)
-            fx_left = fx["bid_size"]
+            fx_used = ZERO
             sales = []
             for holding in holdings:
                 pair = holding["pair"]
                 try:
-                    sale = self.sale_quote(holding, markets[pair], self.book(pair), fx, fx_fee, fx_left)
+                    sale = self.sale_quote(holding, markets[pair], self.book(pair), fx, fx_fee, fx_used)
+                except InsufficientFxDepth:
+                    raise
                 except (MarketUnavailable, KeyError, ValueError, InvalidOperation) as error:
                     sale = dict(symbol=holding["symbol"], pair=pair, quantity=ZERO, net_uah=ZERO,
                                 available_quantity=holding["quantity"], remaining_quantity=holding["quantity"],
                                 warning=str(error))
-                fx_left -= sale.get("net_usdt", ZERO)
+                fx_used += sale.get("net_usdt", ZERO)
                 sales.append(sale)
         except (KeyError, ValueError, InvalidOperation) as error:
             raise MarketUnavailable("USDT/UAH market or fee unavailable") from error
@@ -769,6 +793,7 @@ class Ledger:
             fx = self.book(FX)
             fx["fee_rate"] = self.fee(fx_market)
         sales = []
+        fx_used = ZERO
         for holding in holdings:
             market = markets[holding["pair"]]
             book = self.book(holding["pair"])
@@ -779,7 +804,8 @@ class Ledger:
             total = quantity * book["bid"]
             if quantity < number(market["minAmount"]) or total < number(market["minTotal"]):
                 quantity = ZERO
-            fee_amount, net, net_currency = sale_proceeds(quantity, book["bid"], fee, fx)
+            fee_amount, net, net_currency, conversion_fee = sale_proceeds(quantity, book["bid"], fee, fx, fx_used)
+            fx_used += net
             if currency == "UAH":
                 cost = number(holding.get("basis_uah", "0"))
             else:
@@ -789,7 +815,7 @@ class Ledger:
                               available_quantity=available, quantity=quantity,
                               remaining_quantity=available - quantity, bid=book["bid"],
                               ask=book["ask"], spread=book["ask"] - book["bid"],
-                              fee_rate=fee, fee_usdt=fee_amount, net_usdt=net,
+                              fee_rate=fee, fee_usdt=fee_amount, net_usdt=net, fx_fee_uah=conversion_fee,
                               net_currency=net_currency, cost_basis=cost,
                               realized_pnl=net_currency - cost_for_fill,
                               quote_timestamp=book["timestamp"], received_at=book["received_at"],
@@ -799,23 +825,27 @@ class Ledger:
         return decode(dict(symbol=symbol, revision=journal["revision"], sales=sales,
                            currency=currency, fx=fx, fingerprint=fingerprint))
 
-    def sale_quote(self, holding, market, book, fx, fx_fee, fx_left):
+    def sale_quote(self, holding, market, book, fx, fx_fee, fx_used):
         available = number(holding["quantity"])
         fee = self.fee(market)
         step = max(Decimal(1).scaleb(-int(market["stockPrec"])), number(market.get("stepSize") or "0"))
         price_step = max(Decimal(1).scaleb(-int(market["moneyPrec"])), number(market.get("tickSize") or "0"))
         remaining = floor_step(available, step)
         max_total = number(market["maxTotal"])
-        budget = min(fx_left / (1 - fee), max_total) if max_total else fx_left / (1 - fee)
+        budget = max_total if max_total else None
         fills = []
         for bid, size in book["bids"]:
             if bid % price_step:
                 raise ValueError("Bid does not match market precision")
-            quantity = floor_step(min(size, remaining, budget / bid), step)
+            limit = min(size, remaining)
+            if budget is not None:
+                limit = min(limit, budget / bid)
+            quantity = floor_step(limit, step)
             if quantity:
                 fills.append(dict(price=bid, quantity=quantity))
                 remaining -= quantity
-                budget -= quantity * bid
+                if budget is not None:
+                    budget -= quantity * bid
             if not remaining:
                 break
         quantity = sum((row["quantity"] for row in fills), ZERO)
@@ -829,8 +859,7 @@ class Ledger:
             warning = "Після продажу залишиться частина позиції"
         sell_fee = total * fee
         net = total - sell_fee
-        conversion_fee = net * fx["bid"] * fx_fee
-        uah = (net * fx["bid"] - conversion_fee).quantize(CENT, rounding=ROUND_DOWN)
+        uah, conversion_fee = convert_sale_usdt(fx["bids"], net, fx_fee, fx_used)
         basis = number(holding["basis_uah"])
         sold_basis = basis if quantity == available else (basis * quantity / available).quantize(CENT, rounding=ROUND_DOWN)
         return dict(symbol=holding["symbol"], pair=holding["pair"], side="sell",
@@ -912,6 +941,7 @@ class Ledger:
                 raise MarketUnavailable("Sale quotes expired before saving")
             stamp = now().isoformat()
             sales = []
+            fx_used = ZERO
             for sale in preview["sales"]:
                 available_sale = number(sale["quantity"])
                 units = available_sale if quantity is None else min(available_sale, quantity)
@@ -922,10 +952,14 @@ class Ledger:
                 available_total = number(sale["available_quantity"])
                 basis = number(sale["cost_basis"])
                 cost = sold_basis(basis, units, available_total, CENT if fx else USDT_UNIT)
-                fee, net, credit = sale_proceeds(units, number(sale["bid"]), number(sale["fee_rate"]), fx)
+                fee, net, credit, conversion_fee = sale_proceeds(
+                    units, number(sale["bid"]), number(sale["fee_rate"]), fx, fx_used
+                )
+                fx_used += net
                 sales.append(dict(sale, time=stamp, operation_id=operation_id, quantity=units,
                                   remaining_quantity=available_total - units, fee_usdt=fee, net_usdt=net,
-                                  net_currency=credit, cost_basis=cost, remaining_basis=basis - cost,
+                                  net_currency=credit, fx_fee_uah=conversion_fee,
+                                  cost_basis=cost, remaining_basis=basis - cost,
                                   realized_pnl=credit - cost))
             if not sales:
                 raise MarketUnavailable("No quantity can be sold")
