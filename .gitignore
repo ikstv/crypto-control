@@ -81,6 +81,8 @@ logs/
 *.log
 desktop/**/bin/
 desktop/**/obj/
+*.csproj.user
+*.sqlite*.sha256
 tmp/
 temp/
 *.tmp

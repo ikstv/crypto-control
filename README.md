@@ -1,110 +1,41 @@
 # Crypto Control
 
-Crypto Control — локальний симулятор спотової криптоторгівлі для Windows. Вебінтерфейс відкривається у Chrome. FastAPI надає окремий JSON API для майбутнього Android-клієнта, а SQLite зберігає лише локальний віртуальний портфель.
+Crypto Control is a local Windows application for cryptocurrency market analysis, manual paper trading, and strategy research. Its desktop window displays a localhost FastAPI interface through WinForms and WebView2. The engine can run independently of the window.
 
-Програма показує публічні котирування дев’яти пар WhiteBIT, моделює купівлю та ручний продаж із комісіями, зберігає журнал операцій і рахує прибуток, збиток та просадку. Початковий план становить 10 000 грн. Віртуальні покупки починаються після натискання кнопки в інтерфейсі. Окремий CLI тестує стратегії BTC/USDT на історичних даних.
+## Project status
 
-## Запуск у Windows
-
-Встановіть Python 3.12. У папці проєкту двічі клацніть **start.cmd** або запустіть його з PowerShell:
-
-```powershell
-.\start.cmd
-```
-
-Скрипт створює локальну `.venv`, за потреби встановлює залежності з `requirements.txt` і запускає сервер на `127.0.0.1:8000`. Для першого встановлення потрібен інтернет. Відкрийте [Crypto Control](http://127.0.0.1:8000/) у Chrome. Зупинка сервера — Ctrl+C. При першому запуску створюється `data/crypto_control.sqlite3`. Повторний запуск використовує наявний портфель.
-
-## Резервна копія та відновлення
-
-Команди нижче запускаються з кореня проєкту з Python 3.12. У Windows також можна замінити `python` на `.\.venv\Scripts\python.exe` після першого запуску.
-
-```powershell
-$copy = python .\backup.py create
-python .\backup.py verify "$copy"
-```
-
-`create` відкриває робочу базу для читання й використовує SQLite Backup API, зокрема для підтверджених операцій у WAL. Команда зберігає одну узгоджену копію в `backups/` і повертає її шлях. **Зберігайте разом файл `.sqlite3` та сусідній `.sqlite3.sha256`.** Контрольна сума стосується схеми й записів SQLite. Щоб пережити втрату диска ПК, виберіть приватну папку на іншому диску, наприклад `python .\backup.py create --directory E:\CryptoControlBackups`. У Git потрапляють код, тести та інструкції. Дані, копії та локальні налаштування виключені через `.gitignore`.
-
-`verify` відновлює копію в тимчасову папку, перевіряє цілісність SQLite, звіряє схему та всі записи з контрольною сумою моменту копіювання і читає журнал, залишок у гривнях та кількості монет. Перевірка працює без доступу до WhiteBIT.
-
-Для відновлення в **новий файл** з тієї самої копії:
-
-```powershell
-python .\backup.py restore "$copy" --to .\recovered\crypto_control.sqlite3
-```
-
-Після перевстановлення Windows поверніть код проєкту та обидва файли копії. У змінній `$copy` вкажіть шлях до збереженого `.sqlite3`. Для запуску з відновленим портфелем зупиніть сервер, збережіть наявну папку `data` цілком у приватному місці поза проєктом і виконайте:
-
-```powershell
-python .\backup.py verify "$copy"
-python .\backup.py restore "$copy" --to .\data\crypto_control.sqlite3
-.\start.cmd
-```
-
-Якщо цільовий файл або його WAL, SHM чи журнал уже існує, відновлення завершується з помилкою й зберігає наявні файли.
-
-## Backtest BTC/USDT
-
-Окремий CLI на стандартній бібліотеці Python. Запуск у PowerShell:
-
-```powershell
-python backtest.py --start 2025-01-01 --split 2025-07-01 --end 2026-01-01 --capital 1000
-python -m unittest -v
-```
-
-Дати задаються в UTC. Навчальний відрізок має межі `[start, split)`, відкладений — `[split, end)`. Кожен стартує з однакового капіталу та порожньої позиції. Джерело — [WhiteBIT Public Kline](https://docs.whitebit.com/api-reference/market-data/kline), спотові денні свічки BTC/USDT. Кеш `data/whitebit_btc_usdt_1d.json` повторно використовує вже завантажені дні. Модуль перевіряє часову сітку, пропуски, дублікати, OHLC та обсяг і впорядковує рядки за часом. Робоча база портфеля відокремлена від CLI.
-
-- Buy & Hold купує на першому open. Перетин SMA 10/30 визначається на close, із власним прогрівом у кожному відрізку. Параметри `--fast` і `--slow` задаються наперед.
-- TP/SL відкриває початкову позицію на першому open, перевіряє межі за close відносно ціни входу й повертається в позицію на наступному open після виходу. Повторюваний параметр `--tp-sl 2 1` задає варіант у відсотках. За замовчуванням перевіряються 2/1, 4/2 і 6/3. CLI вибирає за чистим балансом лише на навчальному відрізку й запускає один вибраний TP/SL на відкладеному. Для нового підбору після перегляду результатів потрібен новий відкладений період.
-- Сигнали на close виконуються на наступному open. Для порівняння всі відкриті позиції закриваються за заздалегідь визначеним останнім close. Просадка вимірюється за денними чистими оцінками, угода — завершена пара купівлі й продажу.
-- Модель припускає `--fee 0.1` відсотка за сторону, повний `--spread-bps 10` і `--slippage-bps 5` за сторону. Це сценарні витрати без історичної книги ордерів. Модель використовує весь доступний USDT і дробові обсяги, без відтворення історичних торгових лімітів. Результати в USDT.
-
-## API
-
-Інтерактивна документація доступна за [адресою /docs](http://127.0.0.1:8000/docs), схема — за `/openapi.json`.
-
-| Маршрут | Відповідь |
+| Status | Capabilities |
 | --- | --- |
-| `GET /api/v1/status` | Готовність сервера, демонстраційний режим і стан котирувань |
-| `GET /api/v1/portfolio` | Валюта, початковий капітал, розподілена й вільна сума, список активів |
-| `GET /api/v1/quotes` | Джерело, стан з’єднання та дев’ять запитаних пар |
-| `GET /api/v1/paper` | Вільний баланс, журнал, оцінка і чистий результат або попередження |
-| `GET /api/v1/paper/history` | Збережений стан і журнал без мережевих запитів |
-| `POST /api/v1/paper/start` | Одноразовий віртуальний старт із заголовком `X-Crypto-Control: paper-start` |
-| `GET /api/v1/paper/sale-preview?symbol=BTC` | Попередня оцінка для активу або `symbol=all` |
-| `POST /api/v1/paper/sell` | Підтвердження з JSON-полями `symbol`, `operation_id` і `fingerprint` з оцінки |
-| `PUT /api/v1/paper/risk` | Збереження `paused`, `daily_loss_percent`, `drawdown_percent`, `target_percent` |
+| Implemented | Public WhiteBIT spot quotes for nine pairs, manual simulated portfolio operations, SQLite transaction history, background valuation observations, and a local JSON API |
+| Experimental | BTC/USDT daily SMA 10/30 Shadow Trading, persistent emergency lock, signal history, and historical strategy comparisons with modeled execution costs |
+| Planned | Configurable initial capital for new simulations, a packaged Windows installer, and an Android client with authenticated access |
 
-Для продажу та зміни налаштувань потрібен заголовок `X-Crypto-Control: paper-start`. Якщо ціна виконання, кількість, витрати або склад портфеля змінилися після оцінки, підтвердження повертає HTTP 409. Повторно надішліть той самий `operation_id` після втрати відповіді, щоб отримати попередню квитанцію.
+New databases use **UAH 10,000** as the current demonstration portfolio configuration. The amount comes from a code default and has no user-facing configuration. Existing portfolios retain their stored state.
 
-Продаж зараховує чисті UAH. Якщо ліквідності чи торгового кроку не вистачає для повного закриття, журнал зберігає непродану кількість і її частку собівартості. Реалізований результат дорівнює чистому надходженню мінус списана собівартість. Нереалізований результат — чиста оцінка решти мінус залишкова собівартість. Частки собівартості списуються з точністю до копійки, залишок переноситься до наступного продажу.
+Shadow Trading records BUY, SELL, HOLD, and skipped analyses. Automated paper execution and real trading are not implemented. The historical evaluation did not support enabling automated execution for SMA 10/30. See [Strategy research](docs/research.md).
 
-Пороги за замовчуванням становлять 3% денного збитку, 5% просадки та +2% прибутку. Вони керують сповіщеннями. Пауза блокує нові покупки й дозволяє ручні продажі. Денний результат порівнюється з першою збереженою оцінкою за день UTC. Максимальна просадка рахується від піка серед збережених оцінок, починаючи з початкового капіталу. Оцінки записуються під час успішних запитів стану, тож між запитами рух ринку може не потрапити в статистику.
+## Quick start on Windows
 
-Оновлення схеми додає окремі таблиці продажів, налаштувань ризику та оцінок у транзакції SQLite. Перед оновленням можна зберегти й перевірити копію командами з розділу «Резервна копія та відновлення».
-
-## Віртуальний облік
-
-На екрані «Чому змінився мій баланс?» порівнюються дві останні успішні оцінки сервера. Зміна цін монет оцінюється за серединою між bid і ask та попереднім середнім курсом USDT/UAH. Решту зміни середньої вартості віднесено на валютний курс. Окремі рядки показують зміну спреду, оцінених комісій, доступної ліквідності й обмежень продажу. Рядок «Округлення» включає округлення виручки та окремих складових до копійок. Якщо між оцінками було виконано продаж, показується лише загальна зміна.
-
-API повертає цей розклад у `valuation.balance_change` як десяткові рядки в гривнях. Попередня оцінка зберігається в пам’яті сервера, тому після перезапуску для порівняння знову потрібні дві оцінки.
-
-До натискання «Почати віртуальну торгівлю» весь капітал залишається у гривнях. Старт атомарно записує покупки та залишок у SQLite. Повторний запит повертає той самий журнал. Пари, які не проходять перевірки, пропускаються. Невикористаний бюджет залишається у гривнях.
-
-- Для купівлі беремо ask і доступні обсяги з публічної книги WhiteBIT. Для оцінки активів беремо найкращий bid. Чиста оцінка моделює продаж за доступною глибиною bid і враховує торгові обмеження, залишок монет нижче кроку та комісії.
-- Курс для купівлі — ask прямого ринку USDT/UAH, курс для оцінки в гривнях — bid. Це модель валютного перерахунку за найкращим рівнем із перевіркою обсягу та з урахуванням опублікованої комісії. Журнал містить джерело, час, напрямок і округлення. Списання округляється вгору до копійки, виручка в гривнях — вниз.
-- Taker береться з правил кожної пари, 0,1% у правилах відповідає коефіцієнту 0,001. За потреби задайте в PowerShell `$env:CRYPTO_CONTROL_TAKER_FEE_PERCENT = "0.1"` перед запуском. Це нижня межа для симуляції, ставка біржі має пріоритет, якщо вона вища. Комісія купівлі в базовому активі, продажу — у валюті котирування.
-- USDT-оцінка чистого портфеля враховує результат продажу монет у USDT і гривневий залишок, виражений у USDT за поточним FX bid. Прибуток у USDT порівнюється з 10 000 грн, перерахованими за стартовим ask. Гривневий чистий результат додатково враховує вартість конвертації USDT → UAH. Індикатор +2% базується на чистому результаті в UAH.
-- Якщо курс або потрібна книга недоступні, застаріли (понад 45 секунд) чи не мають достатнього bid-обсягу, оцінка недоступна, а журнал і гривневий залишок зберігаються. Точні десяткові значення доступні в JSON, інтерфейс округлює показ для читабельності.
-
-Сервер перевіряє активність спотових пар через `markets` перед читанням `ticker` приблизно кожні 30 секунд. Ціна `price` передається десятковим рядком у USDT, а `received_at` — час отримання в UTC. Після помилки остання відома ціна в пам’яті має стан `stale`. Для підтверджено недоступної пари або за відсутності ціни поля ціни й часу мають значення `null`. Після перезапуску кеш порожній до першого оновлення.
-
-Числа в полях із суфіксом `_minor` подані цілими копійками. JSON API працює незалежно від вебсторінки. Сервер слухає лише локальний інтерфейс Windows.
-
-Логіка портфеля й SQLite міститься в `portfolio.py`, HTTP API — в `app.py`. Майбутні стратегії та перевірки ризику можна додати окремими модулями між симулятором операцій і збереженням результатів.
-
-## Тести
+Install Python 3.12. From the repository root, run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest -v
+.\start.cmd
 ```
+
+This creates the local virtual environment if needed, installs dependencies, and starts the server at [127.0.0.1:8000](http://127.0.0.1:8000/). Internet access is needed for dependency installation and public market data. Ctrl+C stops this foreground server.
+
+For the standalone window or optional background startup at sign-in, follow the [Windows Desktop guide](desktop/README.md).
+
+## Documentation
+
+- [Architecture and API](docs/architecture.md)
+- [Windows Desktop, engine startup, and tests](desktop/README.md)
+- [Security, backups, and repository hygiene](docs/security.md)
+- [Strategy research and historical results](docs/research.md)
+
+## Roadmap
+
+1. Improve desktop packaging and validate engine recovery and valuation history across Windows sessions.
+2. Add configurable starting capital for new simulations.
+3. Research strategies with out-of-sample evaluation and explicit risk limits before deciding whether to build automated paper execution.
+4. Define authentication and secure networking before introducing an Android client.

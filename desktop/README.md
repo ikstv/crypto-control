@@ -23,4 +23,24 @@ The test executable is produced at:
 
 `desktop\CryptoControl.Desktop\bin\Release\net9.0-windows\publish\CryptoControl.Desktop.exe`
 
-Start the engine first with `.\engine.ps1 -Action start`, then launch the executable. If the engine is unavailable, the window shows a retry message.
+Keep the published executable and its companion files together. Start the engine with `.\start.cmd` in a separate terminal, then launch the executable. If the engine is unavailable, the window offers a retry.
+
+## Optional background engine
+
+After `start.cmd` has prepared the virtual environment, close the foreground server. From the repository root:
+
+```powershell
+.\engine.ps1 -Action install
+.\engine.ps1 -Action start
+.\engine.ps1 -Action status
+```
+
+Installation registers a Task Scheduler job for the current user. Use `-Action stop` to stop the scheduled engine and `-Action start` to clear the stop marker and resume. Use `-Action uninstall` to remove the scheduled job. Run one engine at a time.
+
+## Tests
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest -v
+```
+
+Run from the repository root. Windows engine integration tests require loopback sockets and exercise isolated temporary databases. To smoke-test Desktop manually, start the engine, open the application, check the connection, then close the window and check engine status again.
