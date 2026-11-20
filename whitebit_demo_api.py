@@ -9,11 +9,14 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import sys
 import threading
 import time
+from decimal import Decimal, InvalidOperation
+from http.client import HTTPSConnection
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPSHandler, HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from whitebit_demo_policy import (
     DEMO_ASSETS,
@@ -45,6 +48,22 @@ class WhitebitAPIError(RuntimeError):
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def _connect_ipv4(address, timeout, source_address):
+    host, port = address
+    return socket.create_connection((socket.gethostbyname(host), port), timeout, source_address)
+
+
+class _IPv4HTTPSConnection(HTTPSConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect_ipv4
+
+
+class _IPv4HTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_IPv4HTTPSConnection, req, context=self._context)
 
 
 def sign_payload(payload_json, api_secret):
@@ -89,8 +108,11 @@ def load_credentials(environ=None):
 
 
 def _http_transport(method, url, headers, body, timeout):
-    request = Request(url, data=body, headers=headers or {}, method=method)
-    opener = build_opener(_NoRedirect)
+    request_headers = {"User-Agent": "CryptoControl-WhiteBIT-ReadOnly/1.0", **(headers or {})}
+    request = Request(url, data=body, headers=request_headers, method=method)
+    # The key is restricted to the server's IPv4. Keep TLS validation on the
+    # original WhiteBIT hostname and avoid proxy-configured egress addresses.
+    opener = build_opener(ProxyHandler({}), _IPv4HTTPSHandler(), _NoRedirect())
     try:
         with opener.open(request, timeout=timeout) as response:
             return response.status, response.read()
@@ -126,7 +148,8 @@ class WhitebitDemoClient:
         if not isinstance(status, int) or not isinstance(response_body, (bytes, bytearray)):
             raise WhitebitAPIError("WhiteBIT transport returned an invalid response")
         if status < 200 or status >= 300:
-            raise WhitebitAPIError(f"WhiteBIT API returned HTTP {status}")
+            phase = "public time check" if method == "GET" else "private read"
+            raise WhitebitAPIError(f"WhiteBIT {phase} returned HTTP {status}")
         try:
             result = json.loads(response_body)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
@@ -135,7 +158,7 @@ class WhitebitDemoClient:
             result.get("success") is False or "errors" in result
         ):
             code = result.get("code")
-            suffix = f" (code {code})" if isinstance(code, (int, str)) else ""
+            suffix = f" (code {code})" if type(code) is int and 0 <= code <= 9999 else ""
             raise WhitebitAPIError(f"WhiteBIT rejected the read-only request{suffix}")
         return result
 
@@ -186,11 +209,18 @@ class WhitebitDemoClient:
         if ticker not in DEMO_ASSETS:
             raise DemoPolicyError("balance reads are limited to DBTC and DUSDT")
         response = self._private(BALANCE_PATH, {"ticker": ticker})
+        if isinstance(response, dict) and not response:
+            raise WhitebitAPIError(f"WhiteBIT returned no {ticker} trade balance entry")
         try:
-            row = response[ticker]
-            return {"available": str(row["available"]), "freeze": str(row["freeze"])}
-        except (KeyError, TypeError):
-            raise WhitebitAPIError(f"WhiteBIT returned an invalid {ticker} balance") from None
+            row = response.get(ticker, response) if isinstance(response, dict) else None
+            balance = {field: row[field] for field in ("available", "freeze")}
+            for amount in balance.values():
+                if not isinstance(amount, str) or not Decimal(amount).is_finite():
+                    raise ValueError
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            shape = "object" if isinstance(response, dict) else "array" if isinstance(response, list) else "other"
+            raise WhitebitAPIError(f"WhiteBIT returned an unsupported {ticker} balance ({shape})") from None
+        return balance
 
     def read_order_history(self):
         response = self._private(ORDER_HISTORY_PATH, {
@@ -232,16 +262,10 @@ class WhitebitDemoClient:
 
         success_count = sum(value is not None for value in balances.values())
         success_count += sum(value is not None for value in activity.values())
-        if success_count == 0:
-            raise WhitebitAPIError(
-                "No read-only WhiteBIT endpoint succeeded; check key permissions, "
-                "credentials, and connectivity"
-            )
-
         order_history = activity["order_history"]
         executed_deals = activity["executed_deals"]
         return {
-            "status": "ok" if not errors else "partial",
+            "status": "error" if success_count == 0 else "partial" if errors else "ok",
             "mode": "read_only",
             "pair": DEMO_MARKET,
             "balances": balances,

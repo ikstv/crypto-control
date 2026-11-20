@@ -22,3 +22,19 @@ side (half the 10 bp spread plus 5 bp slippage). Daily PnL is the cumulative
 change from initial capital at estimated liquidation value at the recorded
 midpoint. No exchange orders or Ledger writes. Count valid signals, skips and
 missing days separately when assessing 30-day coverage.
+
+On Ubuntu, `crypto-control-shadow.service` uses the same runner's
+`observe` action. With no admitted strategy it logs one BTC/USDT book midpoint
+or a skip per five-minute UTC slot. ABSTAIN leaves all 1,000 model USDT
+in cash. No position changes, fees or slippage accrue. The private SQLite
+stores the full journal across restarts. The mobile panel reads only the
+atomically published latest 30 entries under /run. Missing slots count gaps
+between recorded observations; stale status also covers an ongoing outage.
+Use `systemctl status crypto-control-shadow.service` to inspect it and
+`sudo systemctl disable --now crypto-control-shadow.service` to stop it.
+
+The current observation record saves the midpoint and quote age, not bid, ask,
+or spread. It is monitoring evidence, not a fill or profitability measure.
+With no admitted candidate the only decision is `ABSTAIN`. See the
+[experiment registry](strategy-experiments.md) before proposing a strategy
+test; already studied windows must not be relabeled as independent.

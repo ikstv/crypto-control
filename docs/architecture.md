@@ -6,6 +6,13 @@ WinForms hosts the HTML interface in WebView2. The interface talks to FastAPI on
 - `portfolio.py` and `ledger.py` store the simulated portfolio, operations, and risk settings in SQLite. Manual sale previews account for order book depth, fees, quantity precision, and USDT/UAH conversion. Partial fills leave the unsold position in the ledger.
 - Background observations run at startup and approximately every five minutes. They store unavailable data as skips. The live “Why did my balance change?” comparison uses in-memory snapshots and starts over on restart.
 - `algorithm.py` persists mode transitions and the emergency lock. `shadow.py` writes a separate signal log. `backtest.py` uses historical candles and a file cache independent of the portfolio database.
+- `whitebit_demo_api.py` and `whitebit_demo_policy.py` provide a bounded read-only private API client. `mobile_status.py` serves a separate authenticated mobile status view. `forward_shadow.py observe` records midpoint-only public BTC observations and `ABSTAIN` while no candidate is admitted.
+
+The WhiteBIT Demo Grid bot's balance, Stock/Money split, and PnL are not
+provided by the current account API integration. Private account-history data
+is account-wide and must not be attributed to the bot. Mobile LTE access and
+the Tailscale route were reported verified by the user on 2026-11-20; those
+observations are not proof of an exchange execution or a strategy edge.
 
 ## API
 
@@ -27,6 +34,10 @@ budget overrun, or an order outside market limits. Only the USDT needed for
 the trade is converted. The crypto fee is deducted from the acquired coins.
 
 See [interactive API docs](http://127.0.0.1:8000/docs) or `/openapi.json` while the server is running.
+
+Strategy hypotheses, rejection criteria, results, and research procedure live
+in the [experiment registry](strategy-experiments.md). The project-day record
+is in the [2026-11-20 log](project-log-2026-11-20.md).
 
 | Endpoint | Purpose |
 | --- | --- |

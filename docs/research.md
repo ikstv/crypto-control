@@ -17,3 +17,9 @@ The study validated 2,148 completed UTC candles. Development used 2021–2025. H
 | No Trade | 0.00% | 0.00% | 0.00% | 0.00% |
 
 The baseline applies WhiteBIT's published standard [spot fee](https://whitebit.com/trading-data/trading-fees) of 0.10% per side. A 10 bp full spread and 5 bp slippage per side are modeled assumptions. Doubling the fee and raising slippage to 25 bp reduced SMA holdout return to −3.04%. The SMA holdout had five completed trades. This sample and cost sensitivity support continued observation only.
+
+These windows have already been examined and cannot serve as independent
+validation for later candidates. See the [strategy experiment registry](strategy-experiments.md)
+for later rejected hypotheses, provenance limits, admission criteria, and the
+required pre-registration procedure. Shadow remains `ABSTAIN` unless a distinct
+candidate passes the registered net-return, drawdown, and validation criteria.

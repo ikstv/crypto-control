@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101826">
+  <meta name="description" content="Стан Crypto Control і торговий баланс WhiteBIT">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+  <title>Crypto Control</title>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Crypto Control</h1>
+      <p id="connection" role="status">Завантаження даних…</p>
+      <p class="muted" id="updated"></p>
+    </header>
+    <section aria-labelledby="balance-title">
+      <h2 id="balance-title">Торговий баланс WhiteBIT</h2>
+      <table>
+        <thead><tr><th>Актив</th><th>Доступно</th><th>Заблоковано</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">DBTC</th><td id="DBTC-available">—</td><td id="DBTC-freeze">—</td></tr>
+          <tr><th scope="row">DUSDT</th><td id="DUSDT-available">—</td><td id="DUSDT-freeze">—</td></tr>
+        </tbody>
+      </table>
+    </section>
+    <section aria-labelledby="shadow-title">
+      <h2 id="shadow-title">Shadow · BTC/USDT</h2>
+      <p id="shadow-state">Очікуємо спостереження</p>
+      <p id="shadow-model"></p>
+      <ol id="shadow-log"></ol>
+    </section>
+    <section aria-labelledby="engine-title">
+      <h2 id="engine-title">Crypto Control Engine</h2>
+      <p id="engine">Стан невідомий</p>
+      <h3>Журнал рішень Paper Trading</h3>
+      <p id="decision-state" class="muted">Очікуємо дані</p>
+      <ul id="decisions"></ul>
+    </section>
+    <section aria-labelledby="grid-title">
+      <h2 id="grid-title">WhiteBIT Demo Grid</h2>
+      <p class="muted">Баланс і PnL цього бота недоступні через API.</p>
+      <a href="https://whitebit.com/ua/trading-bot">Відкрити ботів у WhiteBIT ↗</a>
+    </section>
+  </main>
+</body>
+</html>

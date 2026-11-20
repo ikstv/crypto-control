@@ -8,7 +8,7 @@
 
 - Engine entry point: `engine.py`, launched by `engine-task.cmd` from the repository root. The default listener is `127.0.0.1:8000` (or `CRYPTO_CONTROL_ENGINE_PORT` when explicitly configured).
 - Scheduled task name: `CryptoControlEngine`. `engine.ps1 -Action stop` creates `data\engine-stopped`; the launcher/Engine watches this marker and exits. `engine.ps1 -Action start` removes it and starts the scheduled task. The stop action does **not** disable or unregister the scheduled task. Task settings include up to three restarts after a failure, so the future migration window must prevent task-triggered relaunch and verify the process has exited.
-- Database path inferred from `backup.py`: `C:\AI\Trade\data\crypto_control.sqlite3`. This path was inferred from source; the database file itself was not opened or inspected.
+- Database path inferred from `backup.py`: `data\crypto_control.sqlite3`. This path was inferred from source; the database file itself was not opened or inspected.
 - Backup implementation: `backup.py` uses SQLite Backup API, writes a SHA-256 sidecar, and verifies integrity/foreign keys and a restored snapshot. The default `create` command reads the default database; do not run it until separately authorized.
 - Legacy schema is identified by absence of `portfolio_id` in `settings`; migrated schema by its presence. No explicit application migration version is set in `PRAGMA user_version` by the inspected migration. Therefore the rehearsal must validate actual columns, constraints, indexes, row ownership, and application behavior rather than rely on a numeric schema version.
 - Current local environment observed: Python 3.12.10, Python SQLite 3.49.1; .NET SDK 9.0.200 and .NET 9 Desktop Runtime 9.0.2; WebView2 Runtime 157.0.4341.60. Desktop targets `net9.0-windows` and uses WebView2 package 1.0.2903.40. Recheck availability before any future cutover; do not install components as part of this plan.
@@ -34,11 +34,11 @@ Approval for one gate does not grant approval for the next. Any failed check mea
 5. Only now create the fresh snapshot using the repository virtualenv and explicit paths, for example:
 
    ```powershell
-   $db = 'C:\AI\Trade\data\crypto_control.sqlite3'
-   $backupDir = 'C:\AI\Trade\backups'
-   $copy = & 'C:\AI\Trade\.venv\Scripts\python.exe' 'C:\AI\Trade\backup.py' create --database $db --directory $backupDir
+   $db = Join-Path (Get-Location) 'data\crypto_control.sqlite3'
+   $backupDir = Join-Path (Get-Location) 'backups'
+   $copy = & (Join-Path (Get-Location) '.venv\Scripts\python.exe') (Join-Path (Get-Location) 'backup.py') create --database $db --directory $backupDir
    if ($LASTEXITCODE -ne 0) { throw 'Backup creation failed; NO-GO' }
-   & 'C:\AI\Trade\.venv\Scripts\python.exe' 'C:\AI\Trade\backup.py' verify $copy
+   & (Join-Path (Get-Location) '.venv\Scripts\python.exe') (Join-Path (Get-Location) 'backup.py') verify $copy
    if ($LASTEXITCODE -ne 0) { throw 'Backup verification failed; NO-GO' }
    Get-FileHash -Algorithm SHA256 -LiteralPath $copy
    Get-Content -LiteralPath ($copy + '.sha256')

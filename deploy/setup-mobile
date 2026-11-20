@@ -1,0 +1,37 @@
+#!/bin/bash
+set +x
+set -euo pipefail
+umask 077
+
+[[ $EUID = 0 && -t 0 && -t 2 ]] || {
+    printf '%s\n' 'Run setup-mobile through interactive SSH with sudo.' >&2
+    exit 2
+}
+
+dir=/etc/crypto-control-mobile
+install -d -o root -g root -m 0700 "$dir"
+tmp=$(mktemp -d "$dir/.setup.XXXXXXXX")
+trap 'rm -f -- "$tmp"/*.cred; rmdir -- "$tmp"' EXIT
+names=(mobile_password whitebit_demo_api_key whitebit_demo_api_secret)
+
+for name in "${names[@]}"; do
+    IFS= read -r -s -p "$name (hidden): " value </dev/tty
+    printf '\n' >&2
+    test -n "$value"
+    if [[ "$name" = mobile_password ]]; then
+        LC_ALL=C
+        if [[ ! "$value" =~ ^[!-~]{24,128}$ ]]; then
+            printf '%s\n' 'Use a password of 24–128 printable ASCII characters without spaces.' >&2
+            exit 2
+        fi
+    fi
+    printf '%s' "$value" | systemd-creds encrypt --with-key=host --name="$name" - "$tmp/$name.cred"
+    unset value
+done
+
+for name in "${names[@]}"; do
+    install -o root -g root -m 0600 "$tmp/$name.cred" "$dir/$name.cred"
+done
+systemctl enable crypto-control-mobile.service
+systemctl restart crypto-control-mobile.service
+systemctl is-active crypto-control-mobile.service

@@ -1,0 +1,31 @@
+[Unit]
+Description=Crypto Control read-only mobile panel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/crypto-control
+LoadCredentialEncrypted=mobile_password:/etc/crypto-control-mobile/mobile_password.cred
+LoadCredentialEncrypted=whitebit_demo_api_key:/etc/crypto-control-mobile/whitebit_demo_api_key.cred
+LoadCredentialEncrypted=whitebit_demo_api_secret:/etc/crypto-control-mobile/whitebit_demo_api_secret.cred
+ExecStart=/opt/crypto-control/.venv/bin/python -B /opt/crypto-control/mobile_status.py
+Restart=on-failure
+RestartSec=15s
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=128M
+TasksMax=24
+
+[Install]
+WantedBy=multi-user.target

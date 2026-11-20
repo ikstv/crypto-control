@@ -40,7 +40,8 @@ class WhitebitDemoApiTests(unittest.TestCase):
             path = payload["request"]
             if path == "/api/v4/trade-account/balance":
                 ticker = payload["ticker"]
-                return 200, json.dumps({ticker: {"available": "12.5", "freeze": "1.25"}}).encode()
+                balance = {"available": "12.5", "freeze": "1.25"}
+                return 200, json.dumps(balance if ticker == "DBTC" else {ticker: balance}).encode()
             if path == "/api/v4/trade-account/order/history":
                 return 200, b'{"DBTC_DUSDT":[{"orderId":6,"market":"DBTC_DUSDT","status":"FILLED"}]}'
             if path == "/api/v4/trade-account/executed-history":
@@ -157,6 +158,29 @@ class WhitebitDemoApiTests(unittest.TestCase):
         self.assertFalse(any(path in {
             "/api/v4/orders", "/api/v4/order/new", "/api/v4/order/cancel"
         } for path in requested_paths))
+
+    def test_empty_balance_stays_unavailable(self):
+        def transport(method, url, headers, body, timeout):
+            return 200, b'{"time":1700000000}' if method == "GET" else b'{}'
+
+        client = WhitebitDemoClient("test-key", "test-secret", transport=transport)
+        with self.assertRaisesRegex(WhitebitAPIError, "no DBTC trade balance entry"):
+            client.read_balance("DBTC")
+
+    def test_total_private_failure_keeps_safe_route_diagnostics(self):
+        def transport(method, url, headers, body, timeout):
+            if method == "GET":
+                return 200, b'{"time":1700000000}'
+            return 401, b'{"message":"sensitive response"}'
+
+        result = WhitebitDemoClient("test-key", "test-secret", transport=transport).demo_status()
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(set(result["errors"]), {
+            "balance_DBTC", "balance_DUSDT", "order_history", "executed_deals",
+        })
+        self.assertEqual(set(result["errors"].values()), {"WhiteBIT private read returned HTTP 401"})
+        self.assertNotIn("sensitive response", json.dumps(result))
 
     def test_demo_status_cli_reports_missing_credentials_clearly(self):
         with patch.dict(os.environ, {}, clear=True), patch("sys.stderr") as stderr:

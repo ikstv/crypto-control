@@ -1,0 +1,32 @@
+[Unit]
+Description=Crypto Control public BTC market observations
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+DynamicUser=yes
+StateDirectory=crypto-control-shadow
+StateDirectoryMode=0700
+RuntimeDirectory=crypto-control-shadow
+RuntimeDirectoryMode=0755
+UMask=0077
+WorkingDirectory=/opt/crypto-control
+ExecStart=/opt/crypto-control/.venv/bin/python -B /opt/crypto-control/forward_shadow.py observe --database /var/lib/crypto-control-shadow/observations.sqlite3 --snapshot /run/crypto-control-shadow/status.json
+Restart=on-failure
+RestartSec=15
+CPUQuota=10%
+MemoryMax=96M
+TasksMax=8
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

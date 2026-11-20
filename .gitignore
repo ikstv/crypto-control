@@ -90,4 +90,10 @@ temp/
 *.swp
 *~
 Thumbs.db
-/research/
+# Keep reproducible research scripts and registry evidence in Git. Ignore only
+# local caches, databases, and runner state under research/.
+/research/*.sqlite3
+/research/*.sqlite
+/research/*.db
+/research/*.lock
+/research/experimental-paper/
