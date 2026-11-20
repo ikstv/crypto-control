@@ -6,7 +6,13 @@ import time
 from contextlib import closing, contextmanager
 from decimal import Decimal as D
 from pathlib import Path
-import msvcrt
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - exercised on Linux
+    msvcrt = None
+
+if msvcrt is None:  # pragma: no cover - exercised on Linux
+    import fcntl
 
 from algorithm import Algorithm
 from backtest import DAY, fetch_candles
@@ -23,17 +29,49 @@ LIMIT = D(1000)
 def exclusive(path):
     with path.with_suffix(".lock").open("a+b") as lock:
         lock.seek(0)
-        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        if msvcrt is not None:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             yield
         finally:
             lock.seek(0)
-            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            if msvcrt is not None:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def database_path(data_dir, action):
+    return Path(data_dir) / ("technical.sqlite3" if action == "technical" else "experiment.sqlite3")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["run", "technical", "status", "emergency", "reset"])
+    parser.add_argument("--data-dir", type=Path, default=ROOT)
+    return parser
 
 
 def schema_ready(path):
-    with closing(sqlite3.connect(path)) as db:
+    if not path.exists():
+        return False
+    uri = path.resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as db:
         return any(row[1] == "portfolio_id" for row in db.execute("PRAGMA table_info(settings)"))
+
+
+def read_algorithm_status(path):
+    uri = path.resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as db:
+        exists = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='algorithm_log'"
+        ).fetchone()
+        if not exists:
+            return "stopped"
+        row = db.execute("SELECT mode FROM algorithm_log ORDER BY id DESC LIMIT 1").fetchone()
+        return row[0] if row else "stopped"
 
 
 def setup(path):
@@ -121,17 +159,21 @@ def step(path, slot, decision, fetch):
 
 def main():
     from quotes import fetch_public
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action",choices=["run","technical","status","emergency","reset"])
-    args = parser.parse_args()
-    ROOT.mkdir(parents=True,exist_ok=True)
-    path = ROOT / ("technical.sqlite3" if args.action=="technical" else "experiment.sqlite3")
+    args = build_parser().parse_args()
+    args.data_dir.mkdir(parents=True, exist_ok=True)
+    path = database_path(args.data_dir, args.action)
     algorithm = Algorithm(path)
     if args.action == "emergency":
         print(algorithm.change("emergency"))
         return
-    if args.action == "status" and schema_ready(path):
-        print(json.dumps(dict(mode=algorithm.status(), **state(path,fetch_public)),default=str))
+    if args.action == "status":
+        if not path.exists() or not schema_ready(path):
+            print(json.dumps({"mode": "stopped", "status": "not_initialized"}))
+        else:
+            print(json.dumps(
+                dict(mode=read_algorithm_status(path), **state(path, fetch_public)),
+                default=str,
+            ))
         return
     with exclusive(path):
         setup(path)

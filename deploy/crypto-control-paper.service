@@ -1,0 +1,44 @@
+[Unit]
+Description=Crypto Control experimental paper runner
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/crypto-control
+StateDirectory=crypto-control
+StateDirectoryMode=0700
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/crypto-control/.venv/bin/python /opt/crypto-control/experimental_paper.py run --data-dir /var/lib/crypto-control
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=30s
+CPUQuota=25%
+MemoryMax=512M
+TasksMax=32
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crypto-control-paper
+
+[Install]
+WantedBy=multi-user.target
