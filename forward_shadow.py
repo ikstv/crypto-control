@@ -1,5 +1,6 @@
 """Forward-only daily observations. All times are UTC Unix seconds."""
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -11,7 +12,7 @@ from http.client import HTTPException
 from pathlib import Path
 
 from backtest import Costs, DAY, fetch_candles
-from quotes import fetch_public
+from quotes import fetch_public, fetch_public_bytes
 from shadow import daily_record
 
 DATABASE = Path(__file__).resolve().parent / "research" / "forward-sma-v1.sqlite3"
@@ -99,24 +100,46 @@ def report(db, now):
                    risk="observation only")
 
 
-def observe(db, book=fetch_public, clock=time.time):
+BOOK_PATH = "orderbook/BTC_USDT?limit=5"
+
+
+def observe(db, book=fetch_public_bytes, clock=time.time):
     # No strategy is admitted. Record abstention and the evidence available at the time.
     db.execute("""CREATE TABLE IF NOT EXISTS observations(
         slot INTEGER PRIMARY KEY, observed INTEGER NOT NULL, market_time INTEGER,
         mid TEXT, decision TEXT NOT NULL, reason TEXT NOT NULL)""")
-    slot = int(clock()) // 300
+    db.execute("""CREATE TABLE IF NOT EXISTS book_evidence(
+        slot INTEGER PRIMARY KEY REFERENCES observations(slot), endpoint TEXT NOT NULL,
+        requested REAL NOT NULL, received REAL NOT NULL, exchange_time INTEGER,
+        bid TEXT, ask TEXT, spread TEXT, raw BLOB, sha256 TEXT)""")
+    for action in ("UPDATE", "DELETE"):
+        db.execute(f"""CREATE TRIGGER IF NOT EXISTS evidence_no_{action} BEFORE {action}
+            ON book_evidence BEGIN SELECT RAISE(ABORT,'append only'); END""")
+    requested = clock()
+    slot = int(requested) // 300
     if not db.execute("SELECT 1 FROM observations WHERE slot=?", (slot,)).fetchone():
+        raw = bid = ask = spread = None
         try:
-            snapshot = book("orderbook/BTC_USDT?limit=5")
-            observed = int(clock())
-            stamp, price = market_mid(snapshot, observed)
+            raw = book(BOOK_PATH)
+            received = clock()
+            snapshot = json.loads(raw, parse_float=D)
+            stamp, price = market_mid(snapshot, received)
+            if int(received) // 300 != slot or received < requested:
+                raise ValueError("Outside requested slot")
+            bid, ask = (str(snapshot[key][0][0]) for key in ("bids", "asks"))
+            spread = str(D(ask) - D(bid))
             entry = (stamp, str(price), "ABSTAIN", "no_candidate")
         except (HTTPException, OSError, ValueError, TypeError, KeyError, IndexError, InvalidOperation):
-            observed = int(clock())
+            if raw is None:
+                received = clock()
             entry = (None, None, "SKIP", "no_fresh_quote")
         with db:
-            db.execute("INSERT OR IGNORE INTO observations VALUES(?,?,?,?,?,?)",
-                       (slot, observed, *entry))
+            inserted = db.execute("INSERT OR IGNORE INTO observations VALUES(?,?,?,?,?,?)",
+                                  (slot, int(received), *entry))
+            if inserted.rowcount:
+                db.execute("INSERT INTO book_evidence VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           (slot, BOOK_PATH, requested, received, entry[0], bid, ask, spread,
+                            raw, hashlib.sha256(raw).hexdigest() if raw is not None else None))
     db.row_factory = sqlite3.Row
     rows = db.execute("SELECT * FROM observations ORDER BY slot DESC LIMIT 30").fetchall()
     first, count = db.execute("SELECT MIN(slot), COUNT(*) FROM observations").fetchone()

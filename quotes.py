@@ -14,13 +14,17 @@ INTERVAL = 30
 PAIRS = {f"{symbol}_USDT": symbol for symbol in SYMBOLS}
 
 
-def fetch_public(endpoint):
+def fetch_public_bytes(endpoint):
     request = Request(
         f"https://whitebit.com/api/v4/public/{endpoint}",
         headers={"User-Agent": "CryptoControl/1.0", "Accept": "application/json"},
     )
     with urlopen(request, timeout=5) as response:
-        return json.load(response, parse_float=Decimal)
+        return response.read()
+
+
+def fetch_public(endpoint):
+    return json.loads(fetch_public_bytes(endpoint), parse_float=Decimal)
 
 
 def retry_delay(header):
