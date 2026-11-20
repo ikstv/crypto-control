@@ -41,8 +41,6 @@ class WhitebitDemoApiTests(unittest.TestCase):
             if path == "/api/v4/trade-account/balance":
                 ticker = payload["ticker"]
                 return 200, json.dumps({ticker: {"available": "12.5", "freeze": "1.25"}}).encode()
-            if path == "/api/v4/orders":
-                return 200, b'[{"orderId":7,"market":"DBTC_DUSDT","side":"buy"}]'
             if path == "/api/v4/trade-account/order/history":
                 return 200, b'{"DBTC_DUSDT":[{"orderId":6,"market":"DBTC_DUSDT","status":"FILLED"}]}'
             if path == "/api/v4/trade-account/executed-history":
@@ -54,18 +52,17 @@ class WhitebitDemoApiTests(unittest.TestCase):
         self.assertEqual(result["pair"], "DBTC_DUSDT")
         self.assertEqual(result["balances"]["DBTC"], {"available": "12.5", "freeze": "1.25"})
         self.assertEqual(result["balances"]["DUSDT"]["available"], "12.5")
-        self.assertEqual(result["open_orders_count"], 1)
         self.assertEqual(result["order_history_count"], 1)
         self.assertEqual(result["executed_deals_count"], 1)
         self.assertEqual(result["pnl"]["status"], "unavailable")
         self.assertIn("same WhiteBIT account", result["account_scope_note"])
-        self.assertEqual(sum(call[0] == "POST" for call in calls), 5)
+        self.assertEqual(sum(call[0] == "POST" for call in calls), 4)
         self.assertTrue(all(call[0] != "POST" or call[1].startswith("https://whitebit.com/api/v4/") for call in calls))
         self.assertTrue(all("X-TXC-APIKEY" not in call[2] or call[2]["X-TXC-APIKEY"] == "public-key" for call in calls))
         paths = [json.loads(call[3])["request"] for call in calls if call[0] == "POST"]
         self.assertEqual(paths, [
             "/api/v4/trade-account/balance", "/api/v4/trade-account/balance",
-            "/api/v4/orders", "/api/v4/trade-account/order/history",
+            "/api/v4/trade-account/order/history",
             "/api/v4/trade-account/executed-history",
         ])
 
@@ -80,6 +77,8 @@ class WhitebitDemoApiTests(unittest.TestCase):
             })
         with self.assertRaises(DemoPolicyError):
             client._private("/api/v4/main-account/withdraw", {})
+        with self.assertRaises(DemoPolicyError):
+            client._private("/api/v4/orders", {"market": "DBTC_DUSDT"})
         with self.assertRaises(DemoPolicyError):
             client._private("/api/v4/orders", {"market": "BTC_USDT"})
         self.assertEqual(calls, [])
@@ -146,18 +145,18 @@ class WhitebitDemoApiTests(unittest.TestCase):
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["balances"]["DBTC"]["available"], "2")
         self.assertEqual(result["balances"]["DUSDT"]["available"], "2")
-        self.assertIsNone(result["open_orders"])
         self.assertIsNone(result["order_history"])
         self.assertIsNone(result["executed_deals"])
-        self.assertEqual(set(result["errors"]), {"open_orders", "order_history", "executed_deals"})
+        self.assertEqual(set(result["errors"]), {"order_history", "executed_deals"})
         self.assertEqual(requested_paths, [
             "/api/v4/trade-account/balance",
             "/api/v4/trade-account/balance",
-            "/api/v4/orders",
             "/api/v4/trade-account/order/history",
             "/api/v4/trade-account/executed-history",
         ])
-        self.assertFalse(any("/order/new" in path or "/order/cancel" in path for path in requested_paths))
+        self.assertFalse(any(path in {
+            "/api/v4/orders", "/api/v4/order/new", "/api/v4/order/cancel"
+        } for path in requested_paths))
 
     def test_demo_status_cli_reports_missing_credentials_clearly(self):
         with patch.dict(os.environ, {}, clear=True), patch("sys.stderr") as stderr:

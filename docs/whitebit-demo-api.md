@@ -8,8 +8,8 @@ The client exposes no methods for creating or cancelling orders. Its allowlist
 is defense in depth; it does not make a WhiteBIT API key demo-only.
 
 Run `python whitebit_demo_api.py demo-status` after configuring a read-only
-key. It reads DBTC and DUSDT balances, open orders, order history, and executed
-deals. Results include account-wide DBTC/DUSDT activity from the same WhiteBIT
+key. It reads DBTC and DUSDT balances, order history, and executed deals.
+Results include account-wide DBTC/DUSDT activity from the same WhiteBIT
 account and cannot be attributed to Crypto Control. PnL is marked unavailable:
 these endpoints do not provide a trustworthy account PnL or full cost basis,
 so the client does not infer one. Permission or connectivity failures return
@@ -27,7 +27,6 @@ the client has not been connected to a real account.
 | Purpose | Endpoint | Client behavior |
 | --- | --- | --- |
 | Read trade balance | `/api/v4/trade-account/balance` | Only ticker `DBTC` or `DUSDT` |
-| Read open orders | `/api/v4/orders` | Fixed `market=DBTC_DUSDT` |
 | Read order history | `/api/v4/trade-account/order/history` | Fixed `market=DBTC_DUSDT` |
 | Read executed deals | `/api/v4/trade-account/executed-history` | Fixed `market=DBTC_DUSDT` |
 
@@ -40,19 +39,18 @@ transport dispatch.
 
 The policy module also contains validators for order creation and cancellation
 because of earlier work, but the read-only client explicitly rejects every
-route except the four reads above. An unknown route, another pair, or any
-transfer, withdrawal, margin, or futures request is blocked before network
-dispatch.
+route except the three reads above. Open-order queries are also rejected. An
+unknown route, another pair, or any transfer, withdrawal, margin, or futures
+request is blocked before network dispatch.
 
 ## API key permissions and account isolation
 
-For this read-only integration, create a separate API key and enable only
-**Trading Balance and History**. Keep **Order Management**, Deposit,
+For this read-only integration, enable only these individual API endpoints:
+`/api/v4/trade-account/balance`, `/api/v4/trade-account/order/history`, and
+`/api/v4/trade-account/executed-history`. Leave **Order Management**, Deposit,
 Withdrawal, Transfer between balances, Wallet balance/history, and Codes
-disabled. WhiteBIT groups permissions by category and does not clearly specify
-whether open-order queries are included in Trading Balance and History. If
-`/api/v4/orders` returns permission denied, accept a partial report; do not
-enable Order Management to make it complete.
+disabled. The client does not query open orders, so it does not need any
+Order Management scope.
 
 Enable API IP restriction and allow only the server's confirmed fixed public
 egress IP. Confirm that IP out-of-band before creating a key. WhiteBIT says

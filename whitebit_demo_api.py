@@ -26,11 +26,10 @@ from whitebit_demo_policy import (
 API_BASE = "https://whitebit.com"
 TIME_PATH = "/api/v4/public/time"
 BALANCE_PATH = "/api/v4/trade-account/balance"
-OPEN_ORDERS_PATH = "/api/v4/orders"
 ORDER_HISTORY_PATH = "/api/v4/trade-account/order/history"
 EXECUTION_HISTORY_PATH = "/api/v4/trade-account/executed-history"
 READ_ONLY_PATHS = frozenset({
-    BALANCE_PATH, OPEN_ORDERS_PATH, ORDER_HISTORY_PATH, EXECUTION_HISTORY_PATH,
+    BALANCE_PATH, ORDER_HISTORY_PATH, EXECUTION_HISTORY_PATH,
 })
 PAGE_SIZE = 100
 
@@ -193,14 +192,6 @@ class WhitebitDemoClient:
         except (KeyError, TypeError):
             raise WhitebitAPIError(f"WhiteBIT returned an invalid {ticker} balance") from None
 
-    def read_open_orders(self):
-        response = self._private(OPEN_ORDERS_PATH, {
-            "market": DEMO_MARKET, "limit": PAGE_SIZE, "offset": 0,
-        })
-        if not isinstance(response, list):
-            raise WhitebitAPIError("WhiteBIT returned an invalid open-orders response")
-        return response
-
     def read_order_history(self):
         response = self._private(ORDER_HISTORY_PATH, {
             "market": DEMO_MARKET, "limit": PAGE_SIZE, "offset": 0,
@@ -228,7 +219,6 @@ class WhitebitDemoClient:
                 balances[ticker] = None
                 errors[f"balance_{ticker}"] = str(error)
         reads = (
-            ("open_orders", self.read_open_orders),
             ("order_history", self.read_order_history),
             ("executed_deals", self.read_executed_deals),
         )
@@ -248,7 +238,6 @@ class WhitebitDemoClient:
                 "credentials, and connectivity"
             )
 
-        open_orders = activity["open_orders"]
         order_history = activity["order_history"]
         executed_deals = activity["executed_deals"]
         return {
@@ -256,8 +245,6 @@ class WhitebitDemoClient:
             "mode": "read_only",
             "pair": DEMO_MARKET,
             "balances": balances,
-            "open_orders_count": len(open_orders) if open_orders is not None else None,
-            "open_orders": open_orders,
             "order_history_count": len(order_history) if order_history is not None else None,
             "order_history": order_history,
             "executed_deals_count": len(executed_deals) if executed_deals is not None else None,
