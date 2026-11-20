@@ -49,6 +49,9 @@ costs, provenance limitations, and reproduction paths.
 
 ## Provenance and canonical log
 
-The replay scripts are being added to Git; raw candle caches remain local and ignored. Exact raw-response hashes and immutable upstream snapshots were not recorded. Preserve this reproducibility limitation in future summaries.
-After commit and push, this log and the registry are intended to make GitHub
-the canonical project journal; do not claim that has happened until verified.
+The replay scripts and three 2020 candle excerpts used by the separate
+historical check are committed. The full raw candle caches and SQLite journals
+remain local and ignored. Exact raw-response hashes and immutable upstream
+snapshots were not recorded; preserve this reproducibility limitation in later
+summaries. GitHub `main` is the canonical project journal as of commit
+`7b270dd`.
