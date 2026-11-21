@@ -6,7 +6,7 @@ This is the short starting point for each task. GitHub `main` is canonical.
 
 - Research only: Shadow `ABSTAIN`; Paper Trading off. Do not start trading or signal processes.
 - CC-EXP-003: frozen prospective protocol; collection ongoing; no performance evaluation yet.
-- CC-EXP-004: locally prepared only; not published/registered on GitHub and must not be tested or retuned before publication.
+- CC-EXP-004: local files describe a candidate protocol, but GitHub registry and protocol are not published. Treat it as unregistered; do not test, retune, or assume local parameters are frozen until the proposed protocol and registry entry are reviewed and committed.
 - SMA 10/30, fixed pullback, and monthly trend candidates: rejected; do not repeat studied periods as independent evidence.
 
 ## Do not repeat
@@ -19,7 +19,7 @@ This is the short starting point for each task. GitHub `main` is canonical.
 ## Next
 
 1. Preserve CC-EXP-003 collection unchanged; assess data integrity only under its recorded protocol.
-2. Publish and freeze CC-EXP-004 before any test; until then it remains local preparation.
+2. Review and publish CC-EXP-004 as a frozen protocol and registry entry before any test; until then it remains local preparation.
 3. Record every new check and decision in the canonical registry or project log, then update this index.
 
 ## Canonical records
